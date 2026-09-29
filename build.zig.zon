@@ -10,6 +10,10 @@
             .url = "git+https://git.lilithsemi.com/LilithSemi/almanac.git#d2f7eab8fe7c1ec2d6e6e4d6363c60275fa363fd",
             .hash = "almanac-0.1.0-9SzmcDvHBACa842eo4EKst73ItgkAcNlkpO45Ob4Kiib",
         },
+        .vulcan = .{
+            .url = "git+https://git.lilithsemi.com/LilithSemi/vulcan#cd47a37244ec3281bb563b5bf05d882382e1abaf",
+            .hash = "vulcan-0.0.0-d6EfZIyHqQClqyXYvEx8yNeDZzt6a0s0Rfvazw-X-hq9",
+        },
     },
     .paths = .{""},
     .fingerprint = 0xecd09ace8d31239,
