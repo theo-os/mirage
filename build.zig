@@ -137,6 +137,16 @@ pub fn build(b: *std.Build) void {
             },
         }) });
         b.step("jit-boot", "Build the kernel boot runner for the AArch64 JIT").dependOn(&b.addInstallArtifact(boot, .{}).step);
+        if (target.result.os.tag == .linux) {
+            const user = b.addExecutable(.{ .name = "mirage-aarch64", .root_module = b.createModule(.{
+                .root_source_file = b.path("src/user.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "mirage-jit", .module = jit }},
+            }) });
+            b.installArtifact(user);
+            b.step("jit-user", "Build the AArch64 Linux-user emulator").dependOn(&b.addInstallArtifact(user, .{}).step);
+        }
     }
     if (target.result.os.tag == .macos) {
         const mac_options = b.addOptions();

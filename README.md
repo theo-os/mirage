@@ -48,3 +48,49 @@ with `zig build test-jit-launch`. On x86-64 Linux with `zig` and `qemu-aarch64`,
 guests against QEMU TCG. It also runs the system-register, exception, and
 `DC ZVA` guests without a QEMU oracle; those checks do not claim to compare
 system-level behavior.
+
+### Linux user-mode emulator
+
+On x86-64 Linux, `mirage-aarch64` runs AArch64 Linux ELF programs without a
+guest kernel, using the same Vulcan translator as the full-system backend:
+
+```sh
+zig build jit-user -Doptimize=ReleaseFast
+zig-out/bin/mirage-aarch64 ./aarch64-program argument
+sh test/jit-user.sh
+```
+
+`mirage-jit.user.run` provides the library entry point. The loader supports
+ELF64 little-endian `ET_EXEC` and `ET_DYN`, zero-initialized BSS, and `PT_INTERP`.
+Interpreter paths resolve directly on the host; there is no QEMU-style `-L`
+sysroot prefix. The initial stack contains arguments, inherited environment,
+and Linux auxiliary vectors. Guest exit status becomes the command's exit status.
+Mappings enforce read/write/execute permissions, including instruction fetch
+on cached translations.
+
+Implemented Linux calls: `read`, `write`, `writev`, `openat`, `close`, `lseek`,
+`brk`, anonymous `mmap`, `munmap`, `mprotect`, identity calls, `uname`,
+`clock_gettime`, `getrandom`, `set_tid_address`, `exit`, and `exit_group`.
+Descriptors and guest addresses are translated rather than passed through.
+Unimplemented calls return `-ENOSYS`. Signals, threads, `clone`, `futex`,
+file-backed/fixed mappings, and FP/ASIMD remain unsupported, so this is not
+a general replacement for `qemu-aarch64` or a guarantee that a normal libc
+dynamic linker will run. Unsupported instructions stop with a PC diagnostic.
+Image allocations are limited to 1 GiB per image; the initial stack is 8 MiB.
+This is not a sandbox: guest file I/O uses the host process's filesystem access
+and credentials. Set-id guest executables do not change credentials.
+
+The command accepts the ordinary `binfmt_misc` interpreter calling convention.
+To register it manually, with an absolute installed interpreter path:
+
+```sh
+sudo sh -c 'echo ":mirage-aarch64:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xb7\x00:\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\xfe\xff\xff\xff:/absolute/path/to/mirage-aarch64:" > /proc/sys/fs/binfmt_misc/register'
+```
+
+The mask matches little-endian AArch64 ELF executables and PIE images. This
+requires `binfmt_misc` to be mounted and root access; the build does not alter
+host registrations. No `P`, `O`, or `C` flags are used. Remove the registration
+by writing `-1` to `/proc/sys/fs/binfmt_misc/mirage-aarch64`.
+The comparison script checks static, PIE, and interpreter-handoff guests against
+`qemu-aarch64`, including initial stack, BSS, errno, file I/O, heap growth,
+mapping protection/unmapping, and stdout.
