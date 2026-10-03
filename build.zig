@@ -199,6 +199,22 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const guest_target_x86 = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux });
+    const guest_attest_x86 = b.createModule(.{
+        .root_source_file = b.path("lib/mirage-attest.zig"),
+        .target = guest_target_x86,
+        .optimize = .ReleaseSmall,
+    });
+    const guest_init_x86 = b.addExecutable(.{
+        .name = "guest-init-x86",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/guest/init.zig"),
+            .target = guest_target_x86,
+            .optimize = .ReleaseSmall,
+            .imports = &.{.{ .name = "mirage-attest", .module = guest_attest_x86 }},
+        }),
+    });
+
     // The runner itself, for whichever hypervisor this system has. Which one that is, is decided
     // inside `src/main.zig` and nowhere else.
     if (has_os) {
@@ -343,6 +359,9 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "mirage-attest", .module = attest },
                 .{ .name = "boot-options", .module = boot_options.createModule() },
             },
+        });
+        x86boot_module.addAnonymousImport("guest-init-x86", .{
+            .root_source_file = guest_init_x86.getEmittedBin(),
         });
         const x86boot_tests = b.addTest(.{ .name = "x86boot", .root_module = x86boot_module });
         b.step("test-x86boot", "Boot a real x86 kernel to its serial banner under KVM")
