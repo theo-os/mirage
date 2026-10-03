@@ -7,6 +7,7 @@
 pub const registers = @import("mirage-x86_64/registers.zig");
 pub const Register = registers.Register;
 pub const enter = @import("mirage-x86_64/enter.zig").enter;
+pub const boot = @import("mirage-x86_64/boot.zig");
 
 /// Whether this architecture has a power interface the VMM answers. x86 has none: the
 /// hypervisor never emits a power, idle, or timer exit, so the run loop's arms for them
@@ -17,4 +18,5 @@ test {
     _ = registers;
     _ = Register;
     _ = &enter;
+    _ = boot;
 }
