@@ -1096,8 +1096,9 @@ fn makeLink(self: *Export, into: []u8, head: wire.Header, body: []const u8) usiz
     const path = self.pathOf(head.nodeid, name, &room) orelse
         return self.refuse(into, head, wire.err.noent);
     // What it points at is written down as the guest gave it and never resolved here. A link out of
-    // the share is the guest's own to follow inside its own mount, where it means nothing.
-    std.Io.Dir.symLinkAbsolute(self.io, points_at, path, .{}) catch |failure|
+    // the share is the guest's own to follow inside its own mount, where it means nothing. Never
+    // `symLinkAbsolute`: it asserts the target is absolute, and most of a package's links are not.
+    std.Io.Dir.cwd().symLink(self.io, points_at, path, .{}) catch |failure|
         return self.refuse(into, head, wire.errnoFor(failure));
 
     const attr = self.attrOf(path, self.mayWrite(head.nodeid)) orelse
@@ -1536,6 +1537,37 @@ test "a link is handed over rather than followed" {
     wrote = offered.answer(ask(&request, .readlink, nodeid, &.{}), &answered);
     try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
     try std.testing.expectEqualSlices(u8, "hello", answered[wire.Answer.size..wrote]);
+}
+
+test "a guest makes a link to a relative name, which is what unpacking a package writes" {
+    // `symLinkAbsolute` asserts its target is absolute, so a relative one ended the host process
+    // with "reached unreachable code" instead of making the link. `zig build --fetch` inside a
+    // guest reaches it while it unpacks.
+    const gpa = std.testing.allocator;
+    var bench = try Bench.open(gpa);
+    defer bench.close();
+
+    var offered = try Export.init(gpa, bench.io);
+    defer offered.deinit();
+    try offered.offer("work", bench.at, true);
+
+    var request: [512]u8 = undefined;
+    var answered: [4096]u8 = undefined;
+    const work = try nodeOf(&offered, "work", &request, &answered);
+
+    var wrote = offered.answer(ask(&request, .symlink, work, "made\x00../deep/inside\x00"), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    const nodeid = std.mem.readInt(u64, answered[wire.Answer.size..][0..8], .little);
+
+    // Back as the text the guest gave, which is what keeps the resolving inside its own mount.
+    wrote = offered.answer(ask(&request, .readlink, nodeid, &.{}), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    try std.testing.expectEqualSlices(u8, "../deep/inside", answered[wire.Answer.size..wrote]);
+
+    // An absolute target is text here too, and still means nothing on this end.
+    wrote = offered.answer(ask(&request, .symlink, work, "rooted\x00/nix/store/aaaa\x00"), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    try std.testing.expectEqual(@as(u64, 2), offered.made);
 }
 
 test "opening to write is refused at the open rather than at the write" {
