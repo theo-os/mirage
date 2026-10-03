@@ -147,9 +147,14 @@ pub const Run = shared.Run;
 
 pub const Error = error{HypervisorFault} || ioctl.Error || std.posix.MMapError;
 
-/// Which exit the last run came back with, kept for the completion routing a port read
-/// needs. Filled in later with the real decode.
-pub const LastExit = enum { none, mmio, port_in };
+/// Which exit the last run came back with, kept for routing completeMmioRead.
+/// An IO exit records the data_offset so the completion can write back to the right place.
+pub const LastExit = union(enum) {
+    none,
+    mmio,
+    /// Port read: the KVM data page offset and byte width, so completeMmioRead writes there.
+    io: struct { data_offset: u64, size: u8 },
+};
 
 fd: std.posix.fd_t,
 mapping: []align(std.heap.page_size_min) u8,
@@ -315,16 +320,46 @@ pub fn run(self: *Vcpu) Error!Backend.Exit {
 }
 
 /// KVM takes the value from the run structure when the guest is entered again.
+/// A port read routes to the IO data page; an MMIO read goes to the MMIO data buffer.
 pub fn completeMmioRead(self: *Vcpu, value: u64) Error!void {
-    const mmio = &self.state.data.mmio;
-    if (mmio.len > mmio.data.len) return Error.HypervisorFault;
-    @memcpy(mmio.data[0..mmio.len], std.mem.asBytes(&value)[0..mmio.len]);
+    switch (self.last_exit) {
+        .io => |io| {
+            // The IO data lives at data_offset in the kvm_run mapping, not in the struct fields.
+            if (io.data_offset + io.size > self.mapping.len) return Error.HypervisorFault;
+            @memcpy(self.mapping[io.data_offset..][0..io.size], std.mem.asBytes(&value)[0..io.size]);
+        },
+        .mmio, .none => {
+            const mmio = &self.state.data.mmio;
+            if (mmio.len > mmio.data.len) return Error.HypervisorFault;
+            @memcpy(mmio.data[0..mmio.len], std.mem.asBytes(&value)[0..mmio.len]);
+        },
+    }
 }
 
 fn decode(self: *Vcpu) Error!Backend.Exit {
     const exit = shared.exit;
     const event = shared.event;
     return switch (self.state.exit_reason) {
+        exit.io => blk: {
+            const io = self.state.data.io;
+            // String I/O (count > 1) is not yet supported.
+            if (io.count != 1) return Error.HypervisorFault;
+            const size = std.enums.fromInt(Backend.Size, io.size) orelse return Error.HypervisorFault;
+            // The data page is at data_offset in the kvm_run mapping; never read past it.
+            if (io.data_offset + io.size > self.mapping.len) return Error.HypervisorFault;
+
+            if (io.direction == 1) {
+                // OUT: read the value the guest wrote from the data page.
+                var value: u64 = 0;
+                @memcpy(std.mem.asBytes(&value)[0..io.size], self.mapping[io.data_offset..][0..io.size]);
+                self.last_exit = .{ .io = .{ .data_offset = io.data_offset, .size = io.size } };
+                break :blk .{ .port_out = .{ .port = io.port, .size = size, .value = value } };
+            } else {
+                // IN: record where to write the completion value before re-entry.
+                self.last_exit = .{ .io = .{ .data_offset = io.data_offset, .size = io.size } };
+                break :blk .{ .port_in = .{ .port = io.port, .size = size } };
+            }
+        },
         exit.mmio => blk: {
             const mmio = self.state.data.mmio;
             if (mmio.len > mmio.data.len) return Error.HypervisorFault;
@@ -423,5 +458,46 @@ test "an x86 store to unmapped memory comes back as an mmio write" {
     try cpu.setRegister(.rip, 0x1000);
     try testing.expectEqual(Backend.Exit{
         .mmio_write = .{ .gpa = 0xd000_0000, .size = .byte, .value = 0x4d },
+    }, try cpu.run());
+}
+
+test "an x86 out instruction comes back as a port write" {
+    var vm = try openVm();
+    defer vm.deinit();
+    const region = try vm.addMemory(ram, 4 * std.heap.pageSize(), .shared);
+    var memory: Backend.GuestMemory = .{ .regions = &.{region} };
+    // mov al,0x4d ; out 0xe9,al ; jmp $
+    const code = [_]u8{ 0xb0, 0x4d, 0xe6, 0xe9, 0xeb, 0xfe };
+    try memory.write(ram, &code);
+    var cpu = try Vcpu.create(&vm, 0);
+    defer cpu.deinit();
+    try cpu.setRegister(.rip, ram);
+    try testing.expectEqual(Backend.Exit{
+        .port_out = .{ .port = 0xe9, .size = .byte, .value = 0x4d },
+    }, try cpu.run());
+}
+
+test "an x86 in instruction takes the value the host completes" {
+    var vm = try openVm();
+    defer vm.deinit();
+    const region = try vm.addMemory(ram, 4 * std.heap.pageSize(), .shared);
+    var memory: Backend.GuestMemory = .{ .regions = &.{region} };
+    // in al,0xe9 ; out 0xe9,al ; jmp $
+    // The out after the in echoes back whatever came from the host, avoiding any need
+    // to read registers while the guest is spinning.
+    const code = [_]u8{ 0xe4, 0xe9, 0xe6, 0xe9, 0xeb, 0xfe };
+    try memory.write(ram, &code);
+    var cpu = try Vcpu.create(&vm, 0);
+    defer cpu.deinit();
+    try cpu.setRegister(.rip, ram);
+    // First exit: the guest read a port and is waiting for the host to fill the value.
+    try testing.expectEqual(Backend.Exit{
+        .port_in = .{ .port = 0xe9, .size = .byte },
+    }, try cpu.run());
+    // Route 0x5a into the IO data buffer so KVM loads it into AL on re-entry.
+    try cpu.completeMmioRead(0x5a);
+    // Second exit: the guest echoed the value back out, proving 0x5a reached AL.
+    try testing.expectEqual(Backend.Exit{
+        .port_out = .{ .port = 0xe9, .size = .byte, .value = 0x5a },
     }, try cpu.run());
 }
