@@ -362,20 +362,22 @@ test "the page tables identity-map low memory with 2mb pages" {
 
     // PML4[0] must be present, writable, and point at the PDPT.
     const pml4e = readU64(&memory, low.pml4 + 0);
-    try testing.expect(pml4e & 0x1 != 0);
+    try testing.expect((pml4e & 0x3) == 0x3);
     try testing.expectEqual(low.pdpt, pml4e & ~@as(u64, 0xfff));
 
-    // PDPT[0] must point at the PD.
+    // PDPT[0] must be present, writable, and point at the PD.
     const pdpte = readU64(&memory, low.pdpt + 0);
+    try testing.expect((pdpte & 0x3) == 0x3);
     try testing.expectEqual(low.pd, pdpte & ~@as(u64, 0xfff));
 
     // PD[0]: present, writable, page-size (maps physical 0).
     const pde0 = readU64(&memory, low.pd + 0);
-    try testing.expect(pde0 & 0x81 == 0x81);
+    try testing.expect((pde0 & 0x83) == 0x83);
     try testing.expectEqual(@as(u64, 0), pde0 & 0xffffffffffe00000);
 
-    // PD[1]: maps 0x200000.
+    // PD[1]: present, writable, page-size, mapping 0x200000.
     const pde1 = readU64(&memory, low.pd + 8);
+    try testing.expect((pde1 & 0x83) == 0x83);
     try testing.expectEqual(@as(u64, 0x200000), pde1 & 0xffffffffffe00000);
 }
 
