@@ -10,6 +10,7 @@
 //! and shared while it runs. See the probe in `probe.zig` for what was asked.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = @import("mirage-testing");
 const GuestMemory = @import("mirage-memory").GuestMemory;
 const ioctl = @import("ioctl.zig");
@@ -23,6 +24,7 @@ pub const max_slots = 16;
 const nr = struct {
     const check_extension = 0x03;
     const create_vm = 0x01;
+    const create_irqchip = 0x60;
     const irq_line = 0x61;
     const create_guest_memfd = 0xd4;
     const set_user_memory_region2 = 0x49;
@@ -46,11 +48,17 @@ const spi_base = 32;
 /// `irq_type` 1 selects a shared interrupt on the in kernel controller.
 const irq_type_spi = 1;
 
-/// Raise or lower a device interrupt. The guest sees it through the GIC, so the
-/// controller has to exist before this is called.
-pub fn setIrq(self: *Vm, spi: u32, level: bool) Error!void {
+/// Raise or lower a device interrupt. On x86 the argument is a bare GSI; the
+/// in-kernel PIC and IOAPIC route it. On arm the argument is an SPI number and
+/// the GIC routes it. The controller must exist before this is called.
+pub fn setIrq(self: *Vm, irq: u32, level: bool) Error!void {
+    const encoded: u32 = switch (comptime builtin.cpu.arch) {
+        .x86_64 => irq,
+        .aarch64 => (irq_type_spi << 24) | (spi_base + irq),
+        else => @compileError("setIrq is only defined for x86_64 and aarch64"),
+    };
     const request: IrqLevel = .{
-        .irq = (irq_type_spi << 24) | (spi_base + spi),
+        .irq = encoded,
         .level = @intFromBool(level),
     };
     _ = try ioctl.call(
@@ -91,7 +99,17 @@ pub fn create() Error!Vm {
     // Machine type zero asks for this host's default intermediate physical address
     // size. aarch64 encodes a wider address space in the low bits of this argument.
     const raw = try ioctl.call(kvm, comptime ioctl.request(.none, void, nr.create_vm), 0);
-    return .{ .kvm = kvm, .fd = @intCast(raw) };
+    const vm_fd: std.posix.fd_t = @intCast(raw);
+    errdefer _ = linux.close(vm_fd);
+
+    // On x86 the in-kernel PIC, IOAPIC, and per-vcpu LAPIC are built here, before
+    // any vcpu exists. The kernel requires that order. On arm the GIC fills this
+    // role and is created separately via Gic.zig; nothing changes on that path.
+    if (comptime builtin.cpu.arch == .x86_64) {
+        _ = try ioctl.call(vm_fd, comptime ioctl.request(.none, void, nr.create_irqchip), 0);
+    }
+
+    return .{ .kvm = kvm, .fd = vm_fd };
 }
 
 pub fn deinit(self: *Vm) void {
@@ -252,4 +270,13 @@ pub fn maxVcpus(self: *const Vm) u32 {
         if (advised > 0) return @intCast(advised);
     } else |_| {}
     return 4;
+}
+
+test "an x86 vm accepts an injected irq line" {
+    if (comptime builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var vm = try open();
+    defer vm.deinit();
+    // Raising and lowering a GSI must not error; the in-kernel irqchip routes it.
+    try vm.setIrq(5, true);
+    try vm.setIrq(5, false);
 }
