@@ -4,7 +4,10 @@
 //! before mapping anything avoids surprises at entry.
 
 const std = @import("std");
-const testing = std.testing;
+// A portable module's tests use `mirage-testing`, not `std.testing`, because the standard
+// allocator reaches the page allocator and its failure reports reach `std.Io.Threaded`, and the
+// freestanding build that proves this module names no operating system has neither.
+const testing = @import("mirage-testing");
 const GuestMemory = @import("mirage-memory").GuestMemory;
 const attest = @import("mirage-attest");
 const Manifest = attest.Manifest;
@@ -230,8 +233,8 @@ test "an old protocol or no 64-bit entry is refused" {
 }
 
 test "boot_params carries the e820 map, cmdline pointer, and header" {
-    const backing = try testing.allocator.alloc(u8, 0x200000);
-    defer testing.allocator.free(backing);
+    const backing = try testing.allocator().alloc(u8, 0x200000);
+    defer testing.allocator().free(backing);
     @memset(backing, 0);
     var regions = [_]GuestMemory.Region{.{ .gpa = 0, .len = 0x200000, .backing = .{ .shared = backing } }};
     var memory: GuestMemory = .{ .regions = &regions };
@@ -249,7 +252,7 @@ test "boot_params carries the e820 map, cmdline pointer, and header" {
     // e820_entries at 0x1e8 must be at least 1.
     var n: [1]u8 = undefined;
     try memory.read(default_low.boot_params + 0x1e8, &n);
-    try testing.expect(n[0] >= 1);
+    try std.testing.expect(n[0] >= 1);
 
     // First entry type field is at 0x2d0 + 16 (after the 8-byte addr and 8-byte size).
     var ty: [4]u8 = undefined;
@@ -263,8 +266,8 @@ test "boot_params carries the e820 map, cmdline pointer, and header" {
 }
 
 test "a cmdline longer than its region is refused" {
-    const backing = try testing.allocator.alloc(u8, 0x200000);
-    defer testing.allocator.free(backing);
+    const backing = try testing.allocator().alloc(u8, 0x200000);
+    defer testing.allocator().free(backing);
     @memset(backing, 0);
     var regions = [_]GuestMemory.Region{.{ .gpa = 0, .len = 0x200000, .backing = .{ .shared = backing } }};
     var memory: GuestMemory = .{ .regions = &regions };
@@ -273,15 +276,15 @@ test "a cmdline longer than its region is refused" {
 
     // The cmdline room is pml4 - cmdline = 0x30000 - 0x20000 = 0x10000 bytes.
     // A string one byte longer than that room (after NUL) must be refused.
-    const too_long = try testing.allocator.alloc(u8, 0x10000);
-    defer testing.allocator.free(too_long);
+    const too_long = try testing.allocator().alloc(u8, 0x10000);
+    defer testing.allocator().free(too_long);
     @memset(too_long, 'x');
     try testing.expectError(error.CmdlineTooLong, buildBootParams(&memory, header, too_long, null, default_low));
 }
 
 test "more than 128 regions is refused" {
-    const backing = try testing.allocator.alloc(u8, 0x200000);
-    defer testing.allocator.free(backing);
+    const backing = try testing.allocator().alloc(u8, 0x200000);
+    defer testing.allocator().free(backing);
     @memset(backing, 0);
 
     // Build a region array with 129 entries, all pointing into the same backing.
@@ -353,8 +356,8 @@ fn readU64(memory: *const GuestMemory, gpa: u64) u64 {
 
 test "the page tables identity-map low memory with 2mb pages" {
     // One region covers the full first gigabyte so all table GPAs are reachable.
-    const backing = try testing.allocator.alloc(u8, 0x40000000);
-    defer testing.allocator.free(backing);
+    const backing = try testing.allocator().alloc(u8, 0x40000000);
+    defer testing.allocator().free(backing);
     @memset(backing, 0);
     var regions = [_]GuestMemory.Region{.{ .gpa = 0, .len = 0x40000000, .backing = .{ .shared = backing } }};
     var memory: GuestMemory = .{ .regions = &regions };
@@ -364,28 +367,28 @@ test "the page tables identity-map low memory with 2mb pages" {
 
     // PML4[0] must be present, writable, and point at the PDPT.
     const pml4e = readU64(&memory, low.pml4 + 0);
-    try testing.expect((pml4e & 0x3) == 0x3);
+    try std.testing.expect((pml4e & 0x3) == 0x3);
     try testing.expectEqual(low.pdpt, pml4e & ~@as(u64, 0xfff));
 
     // PDPT[0] must be present, writable, and point at the PD.
     const pdpte = readU64(&memory, low.pdpt + 0);
-    try testing.expect((pdpte & 0x3) == 0x3);
+    try std.testing.expect((pdpte & 0x3) == 0x3);
     try testing.expectEqual(low.pd, pdpte & ~@as(u64, 0xfff));
 
     // PD[0]: present, writable, page-size (maps physical 0).
     const pde0 = readU64(&memory, low.pd + 0);
-    try testing.expect((pde0 & 0x83) == 0x83);
+    try std.testing.expect((pde0 & 0x83) == 0x83);
     try testing.expectEqual(@as(u64, 0), pde0 & 0xffffffffffe00000);
 
     // PD[1]: present, writable, page-size, mapping 0x200000.
     const pde1 = readU64(&memory, low.pd + 8);
-    try testing.expect((pde1 & 0x83) == 0x83);
+    try std.testing.expect((pde1 & 0x83) == 0x83);
     try testing.expectEqual(@as(u64, 0x200000), pde1 & 0xffffffffffe00000);
 }
 
 test "the gdt has a 64-bit code and a data descriptor" {
-    const backing = try testing.allocator.alloc(u8, 0x40000000);
-    defer testing.allocator.free(backing);
+    const backing = try testing.allocator().alloc(u8, 0x40000000);
+    defer testing.allocator().free(backing);
     @memset(backing, 0);
     var regions = [_]GuestMemory.Region{.{ .gpa = 0, .len = 0x40000000, .backing = .{ .shared = backing } }};
     var memory: GuestMemory = .{ .regions = &regions };
@@ -395,11 +398,11 @@ test "the gdt has a 64-bit code and a data descriptor" {
 
     // Code descriptor at GDT[1] (offset +8): L bit is bit 53, must be set.
     const code = readU64(&memory, low.gdt + 8);
-    try testing.expect((code >> 53) & 1 == 1);
+    try std.testing.expect((code >> 53) & 1 == 1);
 
     // Data descriptor at GDT[2] (offset +16): present bit (bit 47) must be set.
     const data = readU64(&memory, low.gdt + 16);
-    try testing.expect((data >> 47) & 1 == 1);
+    try std.testing.expect((data >> 47) & 1 == 1);
 }
 
 /// Where the protected mode kernel is placed. A relocatable bzImage is happy at the one megabyte
@@ -513,7 +516,7 @@ pub fn prepare(
 }
 
 test "a launch places the protected mode kernel and names the zero page" {
-    const gpa = testing.allocator;
+    const gpa = testing.allocator();
     const ram_base = 0;
     const backing = try gpa.alloc(u8, 0x40_0000);
     defer gpa.free(backing);
@@ -549,7 +552,7 @@ test "a launch places the protected mode kernel and names the zero page" {
     try testing.expectEqual(@as(u8, 0x5a), backing[kernel_base]);
 
     // The kernel and the command line were measured, and the manifest is sealed.
-    try testing.expect(manifest.sealed);
+    try std.testing.expect(manifest.sealed);
     try testing.expectEqual(Manifest.Tag.kernel, manifest.entries.items[0].tag);
     try testing.expectEqual(Manifest.Tag.cmdline, manifest.entries.items[1].tag);
 }
