@@ -613,8 +613,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         }
     } else {
         // Only a guest that is starting needs putting at its entry point. A resumed one is
-        // already wherever it stopped.
-        try core.Launch.enter(hv, id, layout);
+        // already wherever it stopped. The boot entry is the architecture's own seam and takes the
+        // concrete vCPU, because x86 reaches long mode through the full segment and control state a
+        // `KVM_SET_SREGS` holds, which the abstract backend does not expose.
+        try arch.boot.enter(&machine.vcpus[id], layout);
     }
 
     // Fold the launch into the chip before the guest runs, the way firmware does for the stages it

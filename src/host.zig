@@ -19,7 +19,14 @@ const Manifest = attest.Manifest;
 const fsmod = @import("mirage-fs");
 
 /// Where the guest's memory starts, and where it sees its serial port.
-pub const ram_base = 0x4000_0000;
+///
+/// A bzImage and the structures it reaches long mode through sit in the first megabytes, and the
+/// identity map covers physical memory from zero, so an x86 guest's RAM starts at zero. An arm guest
+/// is placed relative to a base a megabyte above the devices, so its memory starts there.
+pub const ram_base: u64 = switch (@import("builtin").cpu.arch) {
+    .x86_64 => 0,
+    else => 0x4000_0000,
+};
 pub const uart_base = 0x0900_0000;
 
 /// The address the guest is given on the channel. Anything from three up is a guest;

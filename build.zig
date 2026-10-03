@@ -327,6 +327,27 @@ pub fn build(b: *std.Build) void {
         const boot_tests = b.addTest(.{ .name = "boot", .root_module = boot_module });
         b.step("test-boot", "Boot a real kernel under KVM").dependOn(&b.addRunArtifact(boot_tests).step);
 
+        // The x86 capstone: a real bzImage reaches long mode and prints its banner to the serial port.
+        // Its own step so the arm boot gate above stays one kernel and one architecture, and so the
+        // main test run does not need an x86 kernel to pass.
+        const x86boot_module = b.createModule(.{
+            .root_source_file = b.path("test/x86boot.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "mirage-core", .module = core },
+                .{ .name = "mirage-backend", .module = backend },
+                .{ .name = "mirage-device", .module = device },
+                .{ .name = "mirage-arch", .module = arch },
+                .{ .name = "mirage-memory", .module = memory },
+                .{ .name = "mirage-attest", .module = attest },
+                .{ .name = "boot-options", .module = boot_options.createModule() },
+            },
+        });
+        const x86boot_tests = b.addTest(.{ .name = "x86boot", .root_module = x86boot_module });
+        b.step("test-x86boot", "Boot a real x86 kernel to its serial banner under KVM")
+            .dependOn(&b.addRunArtifact(x86boot_tests).step);
+
         // Stops a guest, moves it to a machine that has never run, and lets it carry on. Its own
         // target because it needs a kernel and because what it proves is separate.
         const snapshot_module = b.createModule(.{

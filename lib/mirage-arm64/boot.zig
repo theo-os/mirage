@@ -167,6 +167,20 @@ pub const Layout = struct {
     log: ?Range = null,
 };
 
+/// Put a guest at its entry point the way the arm64 Linux boot protocol asks.
+///
+/// The protocol wants the device tree address in `x0` and the other three argument registers zeroed.
+/// x86 has to set long mode and a full segment state here, so the boot entry is the seam both
+/// architectures meet; arm's needs only the few general registers. The vCPU is passed in rather than
+/// imported, so this stays below the backend.
+pub fn enter(vcpu: anytype, layout: Layout) !void {
+    try vcpu.setRegister(.pc, layout.entry);
+    try vcpu.setRegister(.x0, layout.device_tree);
+    try vcpu.setRegister(.x1, 0);
+    try vcpu.setRegister(.x2, 0);
+    try vcpu.setRegister(.x3, 0);
+}
+
 pub const PrepareError = error{
     NoRoom,
     /// A device tree node name longer than the buffer that formats it.
