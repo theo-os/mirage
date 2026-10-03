@@ -42,6 +42,18 @@ fn nowMs() i64 {
 /// does. A signal with no `SA_RESTART` takes the CPU back: the blocked ioctl returns `EINTR`.
 fn onAlarm(_: linux.SIG) callconv(.c) void {}
 
+/// `setitimer` takes `struct itimerval` (two `timeval`s with microseconds), not `itimerspec`.
+/// The standard library wrapper uses the wrong type, so the syscall is issued directly here.
+const itimerval = extern struct {
+    it_interval: linux.timeval,
+    it_value: linux.timeval,
+
+    comptime {
+        // Two timeval structs, each sec + usec — 4 words on a 64-bit host.
+        std.debug.assert(@sizeOf(itimerval) == 2 * @sizeOf(linux.timeval));
+    }
+};
+
 fn armTicks(interval_ms: isize) void {
     const act: linux.Sigaction = .{
         .handler = .{ .handler = onAlarm },
@@ -50,13 +62,12 @@ fn armTicks(interval_ms: isize) void {
     };
     _ = linux.sigaction(.ALRM, &act, null);
 
-    // This syscall takes microseconds in its second field, which the standard library names `nsec`.
-    const every: linux.timespec = .{
+    const every: linux.timeval = .{
         .sec = @divTrunc(interval_ms, 1000),
-        .nsec = @rem(interval_ms, 1000) * std.time.us_per_ms,
+        .usec = @rem(interval_ms, 1000) * std.time.us_per_ms,
     };
-    const spec: linux.itimerspec = .{ .it_interval = every, .it_value = every };
-    _ = linux.setitimer(@intFromEnum(linux.ITIMER.REAL), &spec, null);
+    const val: itimerval = .{ .it_interval = every, .it_value = every };
+    _ = linux.syscall3(.setitimer, @bitCast(@as(isize, @intFromEnum(linux.ITIMER.REAL))), @intFromPtr(&val), 0);
 }
 
 /// Map the kernel this machine booted, or nothing when the path is unset or cannot be read.
