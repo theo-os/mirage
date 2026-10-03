@@ -6,6 +6,8 @@
 const std = @import("std");
 const testing = std.testing;
 const GuestMemory = @import("mirage-memory").GuestMemory;
+const attest = @import("mirage-attest");
+const Manifest = attest.Manifest;
 
 pub const Error = error{ TooSmall, NotABzImage, UnsupportedProtocol, No64BitEntry, CmdlineTooLong, TooManyRegions } || GuestMemory.Error;
 
@@ -398,4 +400,156 @@ test "the gdt has a 64-bit code and a data descriptor" {
     // Data descriptor at GDT[2] (offset +16): present bit (bit 47) must be set.
     const data = readU64(&memory, low.gdt + 16);
     try testing.expect((data >> 47) & 1 == 1);
+}
+
+/// Where the protected mode kernel is placed. A relocatable bzImage is happy at the one megabyte
+/// mark, below which the zero page and the page tables sit.
+pub const kernel_base = 0x10_0000;
+
+/// What is being started. x86 boots a bzImage only in this sub-project; firmware is named so a
+/// caller shared with the other architecture can hand across the same kind without a special case.
+pub const Kind = union(enum) {
+    linux,
+    firmware: struct {
+        at: u64,
+        len: u64,
+    },
+};
+
+/// A span of guest memory the loader produced. x86 names nothing in a device tree, so this is only
+/// here to meet the shape the caller expects.
+pub const Range = struct {
+    start: u64,
+    end: u64,
+};
+
+/// The arch neutral launch request, with the same field names the other architecture takes. The
+/// fields x86 does not use are accepted and ignored, because the caller is one source for both.
+pub const Config = struct {
+    kind: Kind = .linux,
+    kernel: []const u8,
+    initrd: ?[]const u8 = null,
+    cmdline: []const u8,
+    rng_seed: ?[]const u8 = null,
+    rootfs_verity: ?[]const u8 = null,
+    block_device: bool = true,
+    vsock: bool = false,
+    balloon: bool = false,
+    net: bool = false,
+    share: bool = false,
+    tpm: bool = false,
+    ram_base: u64,
+    ram_size: u64,
+    cpus: u32,
+    uart_base: u64,
+};
+
+pub const Layout = struct {
+    /// Where the guest starts. The sixty four bit entry is the protected mode base plus the jump the
+    /// header names.
+    entry: u64,
+    /// Where the zero page sits. The long mode entry is handed this in `rsi`, which is where the other
+    /// architecture puts the device tree.
+    device_tree: u64,
+    initrd: ?Range = null,
+    log: ?Range = null,
+};
+
+pub const PrepareError = error{
+    NoRoom,
+} || std.mem.Allocator.Error || Error || Manifest.Error;
+
+/// Place a bzImage and the structures it needs to reach long mode, measuring the kernel and the
+/// command line on the way in, and say where the guest starts.
+///
+/// This produces the layout and the boot state. Entering long mode is a later step; here the guest's
+/// memory is left with everything the entry needs.
+pub fn prepare(
+    gpa: std.mem.Allocator,
+    memory: *GuestMemory,
+    manifest: *Manifest,
+    config: Config,
+) PrepareError!Layout {
+    const parsed = try parse(config.kernel);
+
+    // The protected mode half of the image is everything past the setup sectors. It goes at the one
+    // megabyte mark, where a relocatable kernel is content to run.
+    if (parsed.protected_mode_offset > config.kernel.len) return PrepareError.NoRoom;
+    const protected = config.kernel[parsed.protected_mode_offset..];
+    const end = config.ram_base + config.ram_size;
+    if (kernel_base + protected.len > end) return PrepareError.NoRoom;
+
+    const low = default_low;
+
+    var initrd: ?Initrd = null;
+    var initrd_range: ?Range = null;
+    if (config.initrd) |bytes| {
+        // Above the kernel, rounded to a page, so the kernel and the filesystem do not overlap.
+        const at = std.mem.alignForward(u64, kernel_base + protected.len, 0x1000);
+        if (at + bytes.len > end) return PrepareError.NoRoom;
+        try memory.write(at, bytes);
+        initrd = .{ .address = @intCast(at), .size = @intCast(bytes.len) };
+        initrd_range = .{ .start = at, .end = at + bytes.len };
+    }
+
+    try buildBootParams(memory, parsed.header, config.cmdline, initrd, low);
+    try buildLongMode(memory, low, config.ram_size);
+    try memory.write(kernel_base, protected);
+
+    // The kernel and the command line are measured. x86 has no device tree to measure, and the rest
+    // of the launch inputs reach the guest through the zero page the command line names.
+    try manifest.add(gpa, .kernel, config.kernel);
+    if (config.initrd) |bytes| try manifest.add(gpa, .initrd, bytes);
+    if (config.rng_seed) |bytes| try manifest.add(gpa, .device_config, bytes);
+    if (config.rootfs_verity) |bytes| try manifest.add(gpa, .rootfs_verity, bytes);
+    try manifest.add(gpa, .cmdline, config.cmdline);
+    manifest.seal();
+
+    return .{
+        .entry = kernel_base + parsed.entry_offset,
+        .device_tree = low.boot_params,
+        .initrd = initrd_range,
+    };
+}
+
+test "a launch places the protected mode kernel and names the zero page" {
+    const gpa = testing.allocator;
+    const ram_base = 0;
+    const backing = try gpa.alloc(u8, 0x40_0000);
+    defer gpa.free(backing);
+    @memset(backing, 0);
+    var regions = [_]GuestMemory.Region{.{ .gpa = ram_base, .len = backing.len, .backing = .{ .shared = backing } }};
+    var memory: GuestMemory = .{ .regions = &regions };
+    var manifest: Manifest = .{};
+    defer manifest.deinit(gpa);
+
+    var img = [_]u8{0} ** 4096;
+    img[0x1f1] = 4; // setup_sects, so the protected mode half starts at (4 + 1) * 512
+    std.mem.writeInt(u16, img[0x1fe..][0..2], 0xaa55, .little);
+    std.mem.writeInt(u32, img[0x202..][0..4], 0x53726448, .little); // "HdrS"
+    std.mem.writeInt(u16, img[0x206..][0..2], 0x020c, .little);
+    std.mem.writeInt(u16, img[0x236..][0..2], 0x1, .little); // XLF_KERNEL_64
+    // A byte the loader can find once the image is placed.
+    img[(4 + 1) * 512] = 0x5a;
+
+    const layout = try prepare(gpa, &memory, &manifest, .{
+        .kernel = &img,
+        .cmdline = "console=ttyS0",
+        .ram_base = ram_base,
+        .ram_size = backing.len,
+        .cpus = 1,
+        .uart_base = 0x3f8,
+    });
+
+    // Entered at the protected mode base plus the header's jump.
+    try testing.expectEqual(@as(u64, kernel_base + 0x200), layout.entry);
+    // The zero page is named where the entry will look for it.
+    try testing.expectEqual(default_low.boot_params, layout.device_tree);
+    // The first byte of the protected mode half landed at the one megabyte mark.
+    try testing.expectEqual(@as(u8, 0x5a), backing[kernel_base]);
+
+    // The kernel and the command line were measured, and the manifest is sealed.
+    try testing.expect(manifest.sealed);
+    try testing.expectEqual(Manifest.Tag.kernel, manifest.entries.items[0].tag);
+    try testing.expectEqual(Manifest.Tag.cmdline, manifest.entries.items[1].tag);
 }

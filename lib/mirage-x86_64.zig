@@ -8,6 +8,9 @@ pub const registers = @import("mirage-x86_64/registers.zig");
 pub const Register = registers.Register;
 pub const enter = @import("mirage-x86_64/enter.zig").enter;
 pub const boot = @import("mirage-x86_64/boot.zig");
+/// Where this architecture's devices sit and how many CPUs its memory holds. A runner names this
+/// rather than the device tree, so one runner serves both architectures.
+pub const platform = @import("mirage-x86_64/platform.zig");
 
 /// Whether this architecture has a power interface the VMM answers. x86 has none: the
 /// hypervisor never emits a power, idle, or timer exit, so the run loop's arms for them
@@ -19,4 +22,5 @@ test {
     _ = Register;
     _ = &enter;
     _ = boot;
+    _ = platform;
 }

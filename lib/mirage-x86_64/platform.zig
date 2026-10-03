@@ -1,0 +1,52 @@
+//! Where a guest's devices sit on this architecture, and how many CPUs its memory holds.
+//!
+//! A runner that does not name an architecture still has to place a serial port, a block
+//! device, and the rest somewhere. On x86 the serial port is reached through an I/O port,
+//! the one a PC has always put the first serial line at, and the rest are virtio over
+//! memory mapped I/O in a hole below the region a thirty two bit machine keeps for its
+//! buses. Their interrupts are routed by the I/O APIC the hypervisor built with the
+//! machine, so the numbers here are its global interrupts, chosen above the sixteen a PC
+//! reserves for its legacy devices.
+
+/// A device the guest finds at a fixed place. For a memory mapped device `addr` is a guest
+/// physical address; for the serial port it is the I/O port the guest writes.
+pub const Device = struct {
+    addr: u64,
+    intid: u32,
+};
+
+/// The base of the virtio over memory mapped I/O window. It sits below the hole a thirty two
+/// bit PC keeps for its buses and the local and I/O APICs, and above every address the boot
+/// path writes, so nothing the loader placed is overwritten by a device.
+const virtio_window = 0xd000_0000;
+
+/// One virtio device's window. The same width the other architecture gives one, which is all
+/// the registers a virtio over memory mapped I/O device needs.
+const virtio_stride = 0x200;
+
+/// The first global interrupt a device is given. The sixteen below it are the legacy lines a PC
+/// reserves, so a device numbered from here cannot collide with one.
+const gsi_base = 16;
+
+/// The first serial line of a PC, reached through an I/O port rather than memory. Its legacy
+/// interrupt is four; the in kernel controller routes it, so this runner does not raise it by hand.
+pub const serial: Device = .{ .addr = 0x3f8, .intid = 4 };
+
+pub const virtio: Device = .{ .addr = virtio_window + 0 * virtio_stride, .intid = gsi_base + 0 };
+pub const vsock: Device = .{ .addr = virtio_window + 1 * virtio_stride, .intid = gsi_base + 1 };
+pub const balloon: Device = .{ .addr = virtio_window + 2 * virtio_stride, .intid = gsi_base + 2 };
+pub const net: Device = .{ .addr = virtio_window + 3 * virtio_stride, .intid = gsi_base + 3 };
+pub const fs: Device = .{ .addr = virtio_window + 4 * virtio_stride, .intid = gsi_base + 4 };
+pub const tpm: Device = .{ .addr = virtio_window + 5 * virtio_stride, .intid = gsi_base + 5 };
+
+/// Whether the guest's serial port is reached through an I/O port rather than memory. x86 puts
+/// it on a port, so the run loop gives the serial a port bus rather than the memory one.
+pub const serial_is_port = true;
+
+/// How many CPUs a guest may have. The interrupt controller the hypervisor builds holds far more
+/// than any guest this runner starts, so the bound is a plain ceiling rather than one worked out
+/// from where anything sits in memory.
+pub fn cpusThatFit(ram_base: u64) u32 {
+    _ = ram_base;
+    return 255;
+}

@@ -14,6 +14,14 @@ pub const hvf = switch (builtin.os.tag) {
     else => void,
 };
 
+/// The interrupt controller the guest is given, chosen by the architecture. A runner names this
+/// rather than the GIC, so one runner serves a guest whose controller it builds and one whose
+/// controller the kernel already holds. Only a Linux build reaches it; macOS runs its own runner.
+pub const platform = switch (builtin.os.tag) {
+    .linux => @import("mirage-backend/platform.zig"),
+    else => void,
+};
+
 pub const kvm = switch (builtin.os.tag) {
     .linux => struct {
         pub const ioctl = @import("mirage-backend/linux/kvm/ioctl.zig");
@@ -41,5 +49,6 @@ test {
         _ = kvm.Vcpu;
         _ = kvm.Machine;
         if (builtin.cpu.arch == .aarch64) _ = kvm.Gic;
+        _ = platform;
     }
 }
