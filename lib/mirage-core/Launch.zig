@@ -361,6 +361,10 @@ pub const Run = struct {
     /// time. A machine with one CPU passes none: there is nothing to race with, and a lock nobody
     /// contends for still costs something on every exit.
     guard: ?Guard = null,
+    /// Port-mapped devices, for an x86 guest that writes to I/O ports rather than memory.
+    /// aarch64 never produces port exits, so leaving this null is correct there and on x86
+    /// before a serial device is attached.
+    ports: ?*device.Bus = null,
 };
 
 /// What a caller with more than one CPU hands over so they can share their devices.
@@ -484,8 +488,22 @@ pub fn run(hv: Backend, vcpu: Backend.VcpuId, options: Run) RunError!Reason {
             // giving the host its turn is the whole point, and both happen below.
             .interrupted => {},
 
-            // Device port wiring for x86 arrives later; an unexpected PIO here is a fault.
-            .port_in, .port_out => return Backend.Error.HypervisorFault,
+            // Port exits reach a port bus when one is present. Without one the exit is
+            // unexpected: aarch64 never produces port exits, and x86 before a serial is
+            // attached has nothing to route to.
+            .port_out => |w| if (options.ports) |ports| {
+                take(options);
+                defer release(options);
+                acting(options, vcpu);
+                ports.write(w.port, w.size, w.value);
+            } else return Backend.Error.HypervisorFault,
+            .port_in => |r| if (options.ports) |ports| {
+                take(options);
+                acting(options, vcpu);
+                const value = ports.read(r.port, r.size);
+                release(options);
+                try hv.completeMmioRead(vcpu, value);
+            } else return Backend.Error.HypervisorFault,
         }
 
         // The host gets its turn before the devices are served, so anything it hands to
@@ -995,4 +1013,39 @@ test "firmware larger than the window it was given is refused" {
         .cpus = 1,
         .uart_base = 0x0900_0000,
     }));
+}
+
+test "a guest port write reaches a device on the port bus" {
+    var buf: [8]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&buf);
+    var uart: device.Uart16550 = .{ .sink = &sink };
+    var pdevs = [_]device.Bus.Device{uart.device(0x3f8)};
+    var ports: device.Bus = .{ .devices = &pdevs };
+    var mock: Backend.Mock = .init(&.{
+        .{ .port_out = .{ .port = 0x3f8, .size = .byte, .value = 'h' } },
+        .shutdown,
+    });
+    const hv = mock.backend();
+    const id = try hv.addVcpu();
+
+    var devices = [_]device.Device{};
+    var bus: device.Bus = .{ .devices = &devices };
+
+    try testing.expectEqual(Reason.shutdown, try run(hv, id, .{ .bus = &bus, .ports = &ports }));
+    try testing.expectEqualSlices(u8, "h", sink.buffered());
+}
+
+test "a port write with no port bus faults" {
+    // Without a port bus the exit is unexpected and the caller must decide what to do.
+    // aarch64 never reaches this arm; on x86 the caller omits ports until a serial is wired.
+    var mock: Backend.Mock = .init(&.{
+        .{ .port_out = .{ .port = 0x3f8, .size = .byte, .value = 'h' } },
+    });
+    const hv = mock.backend();
+    const id = try hv.addVcpu();
+
+    var devices = [_]device.Device{};
+    var bus: device.Bus = .{ .devices = &devices };
+
+    try testing.expectError(error.HypervisorFault, run(hv, id, .{ .bus = &bus }));
 }
