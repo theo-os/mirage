@@ -138,26 +138,21 @@ pub const stopped: u32 = 5;
 /// `struct kvm_vcpu_events` — pending exceptions, interrupts, NMI, SMI, and related flags.
 /// Layout mirrors `asm/kvm.h` exactly: the 56-byte prefix lands at a natural u64 boundary.
 const VcpuEvents = extern struct {
-    // exception (8 bytes)
     exc_injected: u8,
     exc_nr: u8,
     exc_has_error_code: u8,
     exc_pending: u8,
     exc_error_code: u32,
-    // interrupt (4 bytes)
     int_injected: u8,
     int_nr: u8,
     int_soft: u8,
     int_shadow: u8,
-    // nmi (4 bytes)
     nmi_injected: u8,
     nmi_pending: u8,
     nmi_masked: u8,
     nmi_pad: u8,
-    // sipi / flags (8 bytes)
     sipi_vector: u32,
     flags: u32,
-    // smi (4 bytes)
     smi_smm: u8,
     smi_pending: u8,
     smi_smm_inside_nmi: u8,
@@ -422,7 +417,7 @@ pub fn completeMmioRead(self: *Vcpu, value: u64) Error!void {
     switch (self.last_exit) {
         .io => |io| {
             // The IO data lives at data_offset in the kvm_run mapping, not in the struct fields.
-            if (io.data_offset + io.size > self.mapping.len) return Error.HypervisorFault;
+            if (io.data_offset > self.mapping.len or io.size > self.mapping.len - io.data_offset) return Error.HypervisorFault;
             @memcpy(self.mapping[io.data_offset..][0..io.size], std.mem.asBytes(&value)[0..io.size]);
         },
         .mmio, .none => {
@@ -443,18 +438,23 @@ fn decode(self: *Vcpu) Error!Backend.Exit {
             if (io.count != 1) return Error.HypervisorFault;
             const size = std.enums.fromInt(Backend.Size, io.size) orelse return Error.HypervisorFault;
             // The data page is at data_offset in the kvm_run mapping; never read past it.
-            if (io.data_offset + io.size > self.mapping.len) return Error.HypervisorFault;
+            if (io.data_offset > self.mapping.len or io.size > self.mapping.len - io.data_offset) return Error.HypervisorFault;
 
-            if (io.direction == 1) {
-                // OUT: read the value the guest wrote from the data page.
-                var value: u64 = 0;
-                @memcpy(std.mem.asBytes(&value)[0..io.size], self.mapping[io.data_offset..][0..io.size]);
-                self.last_exit = .{ .io = .{ .data_offset = io.data_offset, .size = io.size } };
-                break :blk .{ .port_out = .{ .port = io.port, .size = size, .value = value } };
-            } else {
-                // IN: record where to write the completion value before re-entry.
-                self.last_exit = .{ .io = .{ .data_offset = io.data_offset, .size = io.size } };
-                break :blk .{ .port_in = .{ .port = io.port, .size = size } };
+            switch (io.direction) {
+                1 => {
+                    // OUT: read the value the guest wrote from the data page.
+                    var value: u64 = 0;
+                    @memcpy(std.mem.asBytes(&value)[0..io.size], self.mapping[io.data_offset..][0..io.size]);
+                    self.last_exit = .{ .io = .{ .data_offset = io.data_offset, .size = io.size } };
+                    break :blk .{ .port_out = .{ .port = io.port, .size = size, .value = value } };
+                },
+                0 => {
+                    // IN: record where to write the completion value before re-entry.
+                    self.last_exit = .{ .io = .{ .data_offset = io.data_offset, .size = io.size } };
+                    break :blk .{ .port_in = .{ .port = io.port, .size = size } };
+                },
+                // The kernel only emits 0 or 1; any other value is untrusted data.
+                else => return Error.HypervisorFault,
             }
         },
         exit.mmio => blk: {
@@ -511,6 +511,7 @@ pub fn registerList(self: *Vcpu, buffer: []u64) Error![]const u64 {
 
 /// Write a frame header into `into[at..]` and advance `at`.
 fn writeFrame(into: []u8, at: *usize, tag: u8, len: usize) void {
+    std.debug.assert(at.* + frame_overhead <= into.len); // caller must have verified capacity
     into[at.*] = tag;
     at.* += 1;
     std.mem.writeInt(u32, into[at.*..][0..4], @intCast(len), .little);
@@ -521,7 +522,7 @@ fn writeFrame(into: []u8, at: *usize, tag: u8, len: usize) void {
 /// The `ids` parameter is unused on x86; the blob format is fixed.
 pub fn save(self: *Vcpu, ids: []const u64, into: []u8) Error!usize {
     _ = ids;
-    if (into.len < blob_size) return Error.TooBig;
+    if (into.len < blob_size) return Error.InvalidArgument;
 
     var at: usize = 0;
 
