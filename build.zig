@@ -357,15 +357,32 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "mirage-arch", .module = arch },
                 .{ .name = "mirage-memory", .module = memory },
                 .{ .name = "mirage-attest", .module = attest },
+                .{ .name = "mirage-image", .module = image },
                 .{ .name = "boot-options", .module = boot_options.createModule() },
             },
         });
         x86boot_module.addAnonymousImport("guest-init-x86", .{
             .root_source_file = guest_init_x86.getEmittedBin(),
         });
-        const x86boot_tests = b.addTest(.{ .name = "x86boot", .root_module = x86boot_module });
+        // Boot to the serial banner only. The capstone test lives in the same file, so this step is
+        // filtered to the one test that is the B1 gate and nothing else.
+        const x86boot_tests = b.addTest(.{
+            .name = "x86boot",
+            .root_module = x86boot_module,
+            .filters = &.{"serial banner"},
+        });
         b.step("test-x86boot", "Boot a real x86 kernel to its serial banner under KVM")
             .dependOn(&b.addRunArtifact(x86boot_tests).step);
+
+        // The x86 capstone: a real bzImage unpacks an initramfs, runs an x86 `/init` in userspace,
+        // and stops cleanly. Its own step so `zig build test` does not need an x86 kernel.
+        const x86userspace_tests = b.addTest(.{
+            .name = "x86userspace",
+            .root_module = x86boot_module,
+            .filters = &.{"userspace"},
+        });
+        b.step("test-x86userspace", "Boot a real x86 kernel to a guest in userspace under KVM")
+            .dependOn(&b.addRunArtifact(x86userspace_tests).step);
 
         // Stops a guest, moves it to a machine that has never run, and lets it carry on. Its own
         // target because it needs a kernel and because what it proves is separate.

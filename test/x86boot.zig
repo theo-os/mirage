@@ -12,7 +12,12 @@ const arch = @import("mirage-arch");
 const GuestMemory = @import("mirage-memory").GuestMemory;
 const attest = @import("mirage-attest");
 const Manifest = attest.Manifest;
+const image = @import("mirage-image");
 const linux = std.os.linux;
+
+/// The guest userspace, built for x86_64 by the same `zig build` as the VMM. Unpacked
+/// from an archive as the first process the kernel runs.
+const guest_init = @embedFile("guest-init-x86");
 
 const options = @import("boot-options");
 
@@ -23,6 +28,10 @@ const ram_size = 512 << 20;
 
 /// The serial port of a PC, reached through an I/O port rather than memory.
 const serial_port = 0x3f8;
+
+/// COM1's interrupt. The in-kernel controller routes this GSI to the guest, and the first process's
+/// console driver waits on it to send each byte.
+const serial_irq = 4;
 
 /// A booting kernel prints far more than this. The cap is here so a kernel that spins does not hang
 /// the suite; the deadline below stops it sooner on a machine that is merely slow.
@@ -195,4 +204,137 @@ test "a real x86 kernel boots to its serial banner" {
     }
 
     try std.testing.expect(std.mem.indexOf(u8, log, banner) != null);
+}
+
+/// The first line the guest userspace prints. Seeing it is proof the kernel unpacked the
+/// initramfs, found `/init` in it, and ran it as the first process.
+const alive = "mirage guest is alive";
+
+test "a real x86 kernel boots to a guest in userspace and stops cleanly" {
+    // Only an x86 host can build the page tables this gate relies on and run the bzImage it maps.
+    if (@import("builtin").cpu.arch != .x86_64) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+
+    const kernel = (try mapKernel()) orelse return error.SkipZigTest;
+    defer std.posix.munmap(kernel);
+
+    var machine = backend.kvm.Machine.create(gpa, 1) catch |err| switch (err) {
+        error.NoKvm => return error.SkipZigTest,
+        else => return err,
+    };
+    defer machine.deinit();
+
+    const region = try machine.vm.addMemory(ram_base, ram_size, .shared);
+    var regions = [_]GuestMemory.Region{region};
+    var memory: GuestMemory = .{ .regions = &regions };
+
+    const hv = machine.backend();
+    const id = try hv.addVcpu();
+
+    // The controller is the in-kernel one the machine was built with, so this makes nothing on x86.
+    var gic = try backend.platform.createController(&machine.vm, 1);
+    defer gic.deinit();
+
+    var manifest: Manifest = .{};
+    defer manifest.deinit(gpa);
+
+    // The initramfs the kernel unpacks as its root. The guest program sits at `/init`, alongside a
+    // console device node so the first process has somewhere to read and write. Built here with the
+    // same archiver the arm boot gate uses, and handed over by its builder.
+    var archive: image.Cpio = .init(gpa);
+    defer archive.deinit();
+    try archive.addDirectory("dev", 0o755);
+    try archive.addCharacterDevice("dev/console", 0o600, 5, 1);
+    try archive.addFile("init", 0o755, guest_init);
+    const initrd = try archive.finish();
+    defer gpa.free(initrd);
+
+    const layout = try core.Launch.prepare(gpa, &memory, &manifest, .{
+        .kernel = kernel,
+        .initrd = initrd,
+        // The kernel talks to our UART from its first line, unpacks the archive above as its root,
+        // and runs `/init` out of it. It gives up rather than waiting forever on a panic.
+        .cmdline = "console=ttyS0 earlyprintk=serial,ttyS0 panic=-1 rdinit=/init",
+        .ram_base = ram_base,
+        .ram_size = ram_size,
+        .cpus = 1,
+        .uart_base = serial_port,
+    });
+
+    const output = try gpa.alloc(u8, 256 << 10);
+    defer gpa.free(output);
+    var sink = std.Io.Writer.fixed(output);
+    var serial: device.Uart16550 = .{ .sink = &sink };
+
+    var port_devices = [_]device.Bus.Device{serial.device(serial_port)};
+    var ports: device.Bus = .{ .devices = &port_devices };
+    var devices: [0]device.Bus.Device = undefined;
+    var bus: device.Bus = .{ .devices = &devices };
+
+    try arch.boot.enter(&machine.vcpus[id], layout);
+
+    // A guest that is waiting on something that never comes sits in `KVM_RUN` forever, so the run is
+    // bounded by the clock as well as by the exit count.
+    const deadline = nowMs() + 20_000;
+    armTicks(10);
+
+    var exits: usize = 0;
+    var stopped: ?backend.Backend.Exit = null;
+    while (exits < max_exits) : (exits += 1) {
+        // The guest asks the kernel to reset once it is done, which the kernel turns into a stop
+        // this loop sees below. The deadline is only a backstop for a guest that never gets there.
+        if (exits % 1024 == 0 and nowMs() > deadline) {
+            std.debug.print("\n=== deadline after {d} exits ===\n", .{exits});
+            break;
+        }
+
+        // The full console driver the first process reaches writes a byte, enables the transmit
+        // interrupt, and waits for it before the next. The transmitter is never busy, so the line is
+        // raised whenever the guest has asked to hear about it and dropped otherwise. COM1 is GSI 4,
+        // which the in-kernel controller routes.
+        try machine.vm.setIrq(serial_irq, serial.signalling());
+
+        const exit = hv.run(id) catch |err| {
+            std.debug.print("\nrun failed after {d} exits: {t}, kvm said {?}\n", .{ exits, err, machine.fault });
+            break;
+        };
+
+        switch (exit) {
+            .port_out => |w| ports.write(w.port, w.size, w.value),
+            .port_in => |r| try hv.completeMmioRead(id, ports.read(r.port, r.size)),
+            .mmio_write => |w| bus.write(w.gpa, w.size, w.value),
+            .mmio_read => |r| try hv.completeMmioRead(id, bus.read(r.gpa, r.size)),
+            .interrupted => {},
+            else => {
+                stopped = exit;
+                break;
+            },
+        }
+
+        if (sink.buffered().len + 512 > output.len) break;
+    }
+
+    const log = sink.buffered();
+
+    if (std.mem.indexOf(u8, log, alive) == null or stopped == null) {
+        // Where the guest got to, for a run that reached neither userspace nor a clean stop. The rip
+        // needs the concrete vCPU, the same one the boot entry took.
+        const rip = machine.vcpus[id].getRegister(.rip) catch 0;
+        std.debug.print(
+            "\n=== after {d} exits, stopped {?}, rip {x}, unmapped {d} ===\n{s}\n=== end ===\n",
+            .{ exits, stopped, rip, bus.unmapped, log },
+        );
+    }
+
+    // The guest reached userspace: the kernel unpacked the archive, found `/init`, and ran it.
+    try std.testing.expect(std.mem.indexOf(u8, log, alive) != null);
+
+    // And it stopped of its own accord rather than running out of time. The guest asked the kernel
+    // to reset, which with nothing else to reboot through becomes the stop KVM reports.
+    try std.testing.expect(stopped != null);
+    switch (stopped.?) {
+        .shutdown, .reset => {},
+        else => return error.TestUnexpectedResult,
+    }
 }
