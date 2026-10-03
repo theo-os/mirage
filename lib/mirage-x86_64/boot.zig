@@ -185,10 +185,12 @@ pub fn buildBootParams(
     hdr_copy.cmd_line_ptr = @intCast(low.cmdline);
 
     if (initrd) |bytes| {
-        // Sum all region lengths to know the total guest RAM available.
+        // Sum all region lengths to know the total guest RAM available. The room above
+        // initrd_base is found by subtraction so the check cannot wrap on a huge length.
         var total: u64 = 0;
         for (memory.regions) |r| total += r.len;
-        if (initrd_base + bytes.len > total) return error.InitrdTooLarge;
+        const room = if (total > initrd_base) total - initrd_base else 0;
+        if (bytes.len > room) return error.InitrdTooLarge;
 
         try memory.write(initrd_base, bytes);
         hdr_copy.ramdisk_image = @intCast(initrd_base);
@@ -539,7 +541,10 @@ pub fn prepare(
 
     var initrd_range: ?Range = null;
     if (config.initrd) |bytes| {
-        if (initrd_base + bytes.len > end) return PrepareError.NoRoom;
+        // The room above initrd_base is found by subtraction, the same accounting
+        // buildBootParams uses, so neither check wraps on a huge length.
+        const room = if (end > initrd_base) end - initrd_base else 0;
+        if (bytes.len > room) return error.InitrdTooLarge;
         initrd_range = .{ .start = initrd_base, .end = initrd_base + bytes.len };
     }
 
