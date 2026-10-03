@@ -1,13 +1,12 @@
 //! The first process inside a Mirage guest.
 //!
 //! It proves the guest reached userspace, then opens the channel back to whoever
-//! started it, says something and reads the answer. Last it asks the kernel to power
-//! the machine off. That request becomes a PSCI call, which leaves the guest as a
-//! system event exit, so the VMM sees a clean stop rather than a guest that simply
-//! went quiet.
+//! started it, says something and reads the answer. Last it asks the kernel to stop.
+//! On aarch64 that becomes a PSCI system_off call. On x86_64 that becomes a reset.
+//! Either way the VMM sees a clean exit.
 //!
-//! No libc and no allocator. The kernel hands the first process `/dev/console` as its
-//! first three descriptors, so writing to descriptor one reaches the serial port.
+//! No libc and no allocator. The guest opens the console itself and keeps the file
+//! descriptor so its output is not lost. If opening fails it falls back to descriptor one.
 
 const std = @import("std");
 const linux = std.os.linux;
