@@ -12,7 +12,7 @@ const GuestMemory = @import("mirage-memory").GuestMemory;
 const attest = @import("mirage-attest");
 const Manifest = attest.Manifest;
 
-pub const Error = error{ TooSmall, NotABzImage, UnsupportedProtocol, No64BitEntry, CmdlineTooLong, TooManyRegions } || GuestMemory.Error;
+pub const Error = error{ TooSmall, NotABzImage, UnsupportedProtocol, No64BitEntry, CmdlineTooLong, TooManyRegions, InitrdTooLarge } || GuestMemory.Error;
 
 /// The fields the boot path needs, laid out exactly as the spec places them
 /// starting at file offset 0x1f1.  Offsets in comments are relative to 0x1f1.
@@ -137,6 +137,10 @@ pub const default_low: LowLayout = .{
     .gdt = 0x33000,
 };
 
+/// Fixed GPA where the initrd is placed. 64 MiB clears the kernel at 0x100000 and
+/// the decompression working set the kernel needs above it before it mounts a filesystem.
+pub const initrd_base: u64 = 0x4000000;
+
 // The e820 entry stride on disk is always 20 bytes: 8+8+4, no tail padding.
 // A Zig extern struct with those fields pads to 24, so entries are written
 // field by field rather than as a struct copy.
@@ -147,13 +151,11 @@ comptime {
 /// The maximum e820 entries the zero page can hold.
 const max_e820_entries = 128;
 
-/// The optional initrd address and size to store in the header.
-pub const Initrd = struct {
-    address: u32,
-    size: u32,
-};
-
 /// Write the Linux zero page (boot_params) into guest RAM at low.boot_params.
+///
+/// When initrd is non-null the bytes are copied to initrd_base and the ramdisk
+/// fields in the header are set to record where the kernel will find them. The
+/// caller must supply enough guest RAM to hold the initrd above initrd_base.
 ///
 /// The caller provides the memory map through memory.regions; each region
 /// becomes one usable e820 entry.
@@ -161,7 +163,7 @@ pub fn buildBootParams(
     memory: *GuestMemory,
     header: SetupHeader,
     cmdline: []const u8,
-    initrd: ?Initrd,
+    initrd: ?[]const u8,
     low: LowLayout,
 ) Error!void {
     // Reject a cmdline that would not fit in its reserved region.
@@ -182,9 +184,15 @@ pub fn buildBootParams(
     hdr_copy.loadflags |= 0x01; // LOADED_HIGH
     hdr_copy.cmd_line_ptr = @intCast(low.cmdline);
 
-    if (initrd) |rd| {
-        hdr_copy.ramdisk_image = rd.address;
-        hdr_copy.ramdisk_size = rd.size;
+    if (initrd) |bytes| {
+        // Sum all region lengths to know the total guest RAM available.
+        var total: u64 = 0;
+        for (memory.regions) |r| total += r.len;
+        if (initrd_base + bytes.len > total) return error.InitrdTooLarge;
+
+        try memory.write(initrd_base, bytes);
+        hdr_copy.ramdisk_image = @intCast(initrd_base);
+        hdr_copy.ramdisk_size = @intCast(bytes.len);
     }
 
     const hdr_bytes = @as([*]const u8, @ptrCast(&hdr_copy))[0..@sizeOf(SetupHeader)];
@@ -295,6 +303,41 @@ test "more than 128 regions is refused" {
     header.version = 0x020c;
 
     try testing.expectError(error.TooManyRegions, buildBootParams(&memory, header, "x", null, default_low));
+}
+
+test "an initramfs is placed in guest ram and recorded in boot_params" {
+    const backing = try testing.allocator().alloc(u8, 0x8000000); // 128 MiB
+    defer testing.allocator().free(backing);
+    @memset(backing, 0);
+    var memory: GuestMemory = .{ .regions = &.{.{ .gpa = 0, .len = backing.len, .backing = .{ .shared = backing } }} };
+    var header: SetupHeader = std.mem.zeroes(SetupHeader);
+    header.version = 0x020c;
+    const initrd = "INITRAMFSBYTES";
+    try buildBootParams(&memory, header, "console=ttyS0", initrd, default_low);
+    // ramdisk_image/ramdisk_size recorded
+    var img: [4]u8 = undefined;
+    try memory.read(default_low.boot_params + 0x218, &img);
+    var sz: [4]u8 = undefined;
+    try memory.read(default_low.boot_params + 0x21c, &sz);
+    try testing.expectEqual(@as(u32, initrd_base), std.mem.readInt(u32, &img, .little));
+    try testing.expectEqual(@as(u32, initrd.len), std.mem.readInt(u32, &sz, .little));
+    // bytes actually landed
+    var out: [14]u8 = undefined;
+    try memory.read(initrd_base, &out);
+    try testing.expectEqualSlices(u8, initrd, &out);
+}
+
+test "an initramfs past guest ram is refused" {
+    // The region covers the low structures but stops just below initrd_base, so
+    // the initrd cannot fit and the bounds check must fire before the write.
+    const backing = try testing.allocator().alloc(u8, initrd_base); // exactly initrd_base bytes, initrd would go past it
+    defer testing.allocator().free(backing);
+    @memset(backing, 0);
+    var memory: GuestMemory = .{ .regions = &.{.{ .gpa = 0, .len = backing.len, .backing = .{ .shared = backing } }} };
+    var header: SetupHeader = std.mem.zeroes(SetupHeader);
+    header.version = 0x020c;
+    const initrd = "INITRAMFSBYTES";
+    try testing.expectError(error.InitrdTooLarge, buildBootParams(&memory, header, "console=ttyS0", initrd, default_low));
 }
 
 /// GDT selectors matching the descriptors written by buildLongMode.
@@ -494,18 +537,13 @@ pub fn prepare(
 
     const low = default_low;
 
-    var initrd: ?Initrd = null;
     var initrd_range: ?Range = null;
     if (config.initrd) |bytes| {
-        // Above the kernel, rounded to a page, so the kernel and the filesystem do not overlap.
-        const at = std.mem.alignForward(u64, kernel_base + protected.len, 0x1000);
-        if (at + bytes.len > end) return PrepareError.NoRoom;
-        try memory.write(at, bytes);
-        initrd = .{ .address = @intCast(at), .size = @intCast(bytes.len) };
-        initrd_range = .{ .start = at, .end = at + bytes.len };
+        if (initrd_base + bytes.len > end) return PrepareError.NoRoom;
+        initrd_range = .{ .start = initrd_base, .end = initrd_base + bytes.len };
     }
 
-    try buildBootParams(memory, parsed.header, config.cmdline, initrd, low);
+    try buildBootParams(memory, parsed.header, config.cmdline, config.initrd, low);
     try buildLongMode(memory, low, config.ram_size);
     try memory.write(kernel_base, protected);
 
