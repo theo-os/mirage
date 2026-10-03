@@ -305,14 +305,50 @@ pub fn getRegister(self: *Vcpu, reg: Backend.Register) Error!u64 {
 }
 
 pub fn run(self: *Vcpu) Error!Backend.Exit {
-    _ = self;
-    return Error.NotSupported;
+    _ = ioctl.call(self.fd, comptime ioctl.request(.none, void, nr.run), 0) catch |err| switch (err) {
+        // A signal took the CPU back while the guest was still running. That is a VMM
+        // reaching in, not a fault, and the guest carries on from where it was.
+        error.Interrupted => return .interrupted,
+        else => return err,
+    };
+    return self.decode();
 }
 
+/// KVM takes the value from the run structure when the guest is entered again.
 pub fn completeMmioRead(self: *Vcpu, value: u64) Error!void {
-    _ = self;
-    _ = value;
-    return Error.NotSupported;
+    const mmio = &self.state.data.mmio;
+    if (mmio.len > mmio.data.len) return Error.HypervisorFault;
+    @memcpy(mmio.data[0..mmio.len], std.mem.asBytes(&value)[0..mmio.len]);
+}
+
+fn decode(self: *Vcpu) Error!Backend.Exit {
+    const exit = shared.exit;
+    const event = shared.event;
+    return switch (self.state.exit_reason) {
+        exit.mmio => blk: {
+            const mmio = self.state.data.mmio;
+            if (mmio.len > mmio.data.len) return Error.HypervisorFault;
+            const size = std.enums.fromInt(Backend.Size, mmio.len) orelse return Error.HypervisorFault;
+            self.last_exit = .mmio;
+
+            if (mmio.is_write == 0) break :blk .{ .mmio_read = .{
+                .gpa = mmio.phys_addr,
+                .size = size,
+                .dest = 0,
+            } };
+
+            var value: u64 = 0;
+            @memcpy(std.mem.asBytes(&value)[0..mmio.len], mmio.data[0..mmio.len]);
+            break :blk .{ .mmio_write = .{ .gpa = mmio.phys_addr, .size = size, .value = value } };
+        },
+        exit.shutdown => .shutdown,
+        exit.system_event => switch (self.state.data.system_event.type) {
+            event.reset => .reset,
+            event.shutdown => .shutdown,
+            else => Error.HypervisorFault,
+        },
+        else => Error.HypervisorFault,
+    };
 }
 
 pub fn runState(self: *Vcpu) Error!u32 {
@@ -372,4 +408,20 @@ test "an x86 register written is the register read back" {
     try cpu.setRegister(.rsi, 0xdead_beef);
     try testing.expectEqual(@as(u64, 0x1000), try cpu.getRegister(.rip));
     try testing.expectEqual(@as(u64, 0xdead_beef), try cpu.getRegister(.rsi));
+}
+
+test "an x86 store to unmapped memory comes back as an mmio write" {
+    var vm = try openVm();
+    defer vm.deinit();
+    const region = try vm.addMemory(0x1000, 4 * std.heap.pageSize(), .shared);
+    var memory: Backend.GuestMemory = .{ .regions = &.{region} };
+    // mov byte ptr [0xd0000000], 0x4d ; jmp $
+    const code = [_]u8{ 0xc6, 0x05, 0x00, 0x00, 0x00, 0xd0, 0x4d, 0xeb, 0xfe };
+    try memory.write(0x1000, &code);
+    var cpu = try Vcpu.create(&vm, 0);
+    defer cpu.deinit();
+    try cpu.setRegister(.rip, 0x1000);
+    try testing.expectEqual(Backend.Exit{
+        .mmio_write = .{ .gpa = 0xd000_0000, .size = .byte, .value = 0x4d },
+    }, try cpu.run());
 }
