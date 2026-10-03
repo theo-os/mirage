@@ -58,7 +58,7 @@ pub fn build(b: *std.Build) void {
     });
     // The x86 arch module is built on every host so its tests run, even while a build
     // for another target does not select it.
-    const x86_64 = add.lib("mirage-x86_64", &.{});
+    const x86_64 = add.lib("mirage-x86_64", &.{.{ .name = "mirage-memory", .module = memory }});
     // One architecture, chosen by the target, exposed under the one name the backend and
     // the core name. The concrete modules stay available where a file names an arch.
     const arch = switch (target.result.cpu.arch) {

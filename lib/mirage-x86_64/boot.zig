@@ -5,8 +5,9 @@
 
 const std = @import("std");
 const testing = std.testing;
+const GuestMemory = @import("mirage-memory").GuestMemory;
 
-pub const Error = error{ TooSmall, NotABzImage, UnsupportedProtocol, No64BitEntry };
+pub const Error = error{ TooSmall, NotABzImage, UnsupportedProtocol, No64BitEntry, CmdlineTooLong, TooManyRegions } || GuestMemory.Error;
 
 /// The fields the boot path needs, laid out exactly as the spec places them
 /// starting at file offset 0x1f1.  Offsets in comments are relative to 0x1f1.
@@ -111,6 +112,94 @@ pub fn parse(image: []const u8) Error!Parsed {
     };
 }
 
+/// Fixed low-memory GPAs for the boot params and support structures.
+/// All values sit below the kernel at 0x100000.
+pub const LowLayout = struct {
+    boot_params: u64,
+    cmdline: u64,
+    pml4: u64,
+    pdpt: u64,
+    pd: u64,
+    gdt: u64,
+};
+
+pub const default_low: LowLayout = .{
+    .boot_params = 0x10000,
+    .cmdline = 0x20000,
+    .pml4 = 0x30000,
+    .pdpt = 0x31000,
+    .pd = 0x32000,
+    .gdt = 0x33000,
+};
+
+// The e820 entry stride on disk is always 20 bytes: 8+8+4, no tail padding.
+// A Zig extern struct with those fields pads to 24, so entries are written
+// field by field rather than as a struct copy.
+comptime {
+    std.debug.assert(8 + 8 + 4 == 20);
+}
+
+/// The maximum e820 entries the zero page can hold.
+const max_e820_entries = 128;
+
+/// The optional initrd address and size to store in the header.
+pub const Initrd = struct {
+    address: u32,
+    size: u32,
+};
+
+/// Write the Linux zero page (boot_params) into guest RAM at low.boot_params.
+///
+/// The caller provides the memory map through memory.regions; each region
+/// becomes one usable e820 entry.
+pub fn buildBootParams(
+    memory: *GuestMemory,
+    header: SetupHeader,
+    cmdline: []const u8,
+    initrd: ?Initrd,
+    low: LowLayout,
+) Error!void {
+    // Reject a cmdline that would not fit in its reserved region.
+    const cmdline_room = low.pml4 - low.cmdline;
+    if (cmdline.len + 1 > cmdline_room) return error.CmdlineTooLong;
+
+    const n_regions = memory.regions.len;
+    if (n_regions > max_e820_entries) return error.TooManyRegions;
+
+    // Write the cmdline bytes NUL-terminated at the cmdline GPA.
+    try memory.write(low.cmdline, cmdline);
+    const nul = [1]u8{0};
+    try memory.write(low.cmdline + cmdline.len, &nul);
+
+    // Copy the setup header into the zero page at offset 0x1f1.
+    var hdr_copy = header;
+    hdr_copy.type_of_loader = 0xff;
+    hdr_copy.loadflags |= 0x01; // LOADED_HIGH
+    hdr_copy.cmd_line_ptr = @intCast(low.cmdline);
+
+    if (initrd) |rd| {
+        hdr_copy.ramdisk_image = rd.address;
+        hdr_copy.ramdisk_size = rd.size;
+    }
+
+    const hdr_bytes = @as([*]const u8, @ptrCast(&hdr_copy))[0..@sizeOf(SetupHeader)];
+    try memory.write(low.boot_params + 0x1f1, hdr_bytes);
+
+    // Write e820_entries count at offset 0x1e8.
+    const e820_count: u8 = @intCast(n_regions);
+    try memory.write(low.boot_params + 0x1e8, &[1]u8{e820_count});
+
+    // Serialize each e820 entry as 20 packed bytes: addr(8) + size(8) + type(4).
+    for (memory.regions, 0..) |region, i| {
+        const entry_base = low.boot_params + 0x2d0 + i * 20;
+        var buf: [20]u8 = undefined;
+        std.mem.writeInt(u64, buf[0..8], region.gpa, .little);
+        std.mem.writeInt(u64, buf[8..16], region.len, .little);
+        std.mem.writeInt(u32, buf[16..20], 1, .little); // type 1: usable RAM
+        try memory.write(entry_base, &buf);
+    }
+}
+
 test "a valid 64-bit bzImage header parses" {
     var img = [_]u8{0} ** 2048;
     img[0x1f1] = 4; // setup_sects
@@ -136,4 +225,69 @@ test "an old protocol or no 64-bit entry is refused" {
     std.mem.writeInt(u16, img[0x206..][0..2], 0x020c, .little);
     // xloadflags left 0 -> no XLF_KERNEL_64
     try testing.expectError(error.No64BitEntry, parse(&img));
+}
+
+test "boot_params carries the e820 map, cmdline pointer, and header" {
+    const backing = try testing.allocator.alloc(u8, 0x200000);
+    defer testing.allocator.free(backing);
+    @memset(backing, 0);
+    var regions = [_]GuestMemory.Region{.{ .gpa = 0, .len = 0x200000, .backing = .{ .shared = backing } }};
+    var memory: GuestMemory = .{ .regions = &regions };
+    var header: SetupHeader = std.mem.zeroes(SetupHeader);
+    header.version = 0x020c;
+    // boot_flag at rel offset 0x0d (abs 0x1fe): set it so the copy preserves it
+    header.boot_flag = 0xaa55;
+    try buildBootParams(&memory, header, "console=ttyS0", null, default_low);
+
+    // The copied header carries boot_flag 0xaa55 at zero-page offset 0x1fe.
+    var flag_buf: [2]u8 = undefined;
+    try memory.read(default_low.boot_params + 0x1fe, &flag_buf);
+    try testing.expectEqual(@as(u16, 0xaa55), std.mem.readInt(u16, &flag_buf, .little));
+
+    // e820_entries at 0x1e8 must be at least 1.
+    var n: [1]u8 = undefined;
+    try memory.read(default_low.boot_params + 0x1e8, &n);
+    try testing.expect(n[0] >= 1);
+
+    // First entry type field is at 0x2d0 + 16 (after the 8-byte addr and 8-byte size).
+    var ty: [4]u8 = undefined;
+    try memory.read(default_low.boot_params + 0x2d0 + 16, &ty);
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, &ty, .little));
+
+    // cmd_line_ptr at zero-page offset 0x228 must point at the cmdline GPA.
+    var ptr_buf: [4]u8 = undefined;
+    try memory.read(default_low.boot_params + 0x228, &ptr_buf);
+    try testing.expectEqual(@as(u32, @intCast(default_low.cmdline)), std.mem.readInt(u32, &ptr_buf, .little));
+}
+
+test "a cmdline longer than its region is refused" {
+    const backing = try testing.allocator.alloc(u8, 0x200000);
+    defer testing.allocator.free(backing);
+    @memset(backing, 0);
+    var regions = [_]GuestMemory.Region{.{ .gpa = 0, .len = 0x200000, .backing = .{ .shared = backing } }};
+    var memory: GuestMemory = .{ .regions = &regions };
+    var header: SetupHeader = std.mem.zeroes(SetupHeader);
+    header.version = 0x020c;
+
+    // The cmdline room is pml4 - cmdline = 0x30000 - 0x20000 = 0x10000 bytes.
+    // A string one byte longer than that room (after NUL) must be refused.
+    const too_long = try testing.allocator.alloc(u8, 0x10000);
+    defer testing.allocator.free(too_long);
+    @memset(too_long, 'x');
+    try testing.expectError(error.CmdlineTooLong, buildBootParams(&memory, header, too_long, null, default_low));
+}
+
+test "more than 128 regions is refused" {
+    const backing = try testing.allocator.alloc(u8, 0x200000);
+    defer testing.allocator.free(backing);
+    @memset(backing, 0);
+
+    // Build a region array with 129 entries, all pointing into the same backing.
+    var regions: [129]GuestMemory.Region = undefined;
+    for (&regions) |*r| r.* = .{ .gpa = 0, .len = 0x200000, .backing = .{ .shared = backing } };
+    var memory: GuestMemory = .{ .regions = &regions };
+    var header: SetupHeader = std.mem.zeroes(SetupHeader);
+    header.version = 0x020c;
+
+    try testing.expectError(error.TooManyRegions, buildBootParams(&memory, header, "x", null, default_low));
 }
