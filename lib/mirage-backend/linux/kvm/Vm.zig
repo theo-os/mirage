@@ -26,8 +26,19 @@ const nr = struct {
     const create_vm = 0x01;
     const create_irqchip = 0x60;
     const irq_line = 0x61;
+    const create_pit2 = 0x77;
     const create_guest_memfd = 0xd4;
     const set_user_memory_region2 = 0x49;
+};
+
+/// `struct kvm_pit_config`: one word of flags and fifteen reserved, sixty four bytes in all.
+const PitConfig = extern struct {
+    flags: u32,
+    pad: [15]u32,
+
+    comptime {
+        std.debug.assert(@sizeOf(PitConfig) == 64);
+    }
 };
 
 /// `KVM_MEM_GUEST_MEMFD` in `linux/kvm.h`.
@@ -107,6 +118,12 @@ pub fn create() Error!Vm {
     // role and is created separately via Gic.zig; nothing changes on that path.
     if (comptime builtin.cpu.arch == .x86_64) {
         _ = try ioctl.call(vm_fd, comptime ioctl.request(.none, void, nr.create_irqchip), 0);
+
+        // The in-kernel timer the guest's clock needs. Without it the kernel reaches userspace but
+        // its timekeeping never advances, so the first process makes no progress. The LAPIC timer is
+        // not enough here: the kernel calibrates against this one first.
+        const pit: PitConfig = .{ .flags = 0, .pad = @splat(0) };
+        _ = try ioctl.call(vm_fd, comptime ioctl.request(.write, PitConfig, nr.create_pit2), @intFromPtr(&pit));
     }
 
     return .{ .kvm = kvm, .fd = vm_fd };

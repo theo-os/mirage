@@ -40,8 +40,19 @@ const SockaddrVm = extern struct {
     zero: [3]u8 = @splat(0),
 };
 
+/// Where the guest's lines go. The kernel hands the first process `/dev/console` as its first
+/// descriptors, but only where it brought that console up as a tty the process may write. A guest
+/// opens the console itself and keeps the descriptor, so a line is seen wherever the console lives
+/// rather than lost when the kernel left the standard descriptors closed.
+var console_fd: i32 = 1;
+
+fn openConsole() void {
+    const opened = linux.open("/dev/console", .{ .ACCMODE = .WRONLY }, 0);
+    if (std.posix.errno(opened) == .SUCCESS) console_fd = @intCast(opened);
+}
+
 fn say(message: []const u8) void {
-    _ = linux.write(1, message.ptr, message.len);
+    _ = linux.write(console_fd, message.ptr, message.len);
 }
 
 /// Open the channel, send a line and read what comes back. Every step says what it
@@ -956,6 +967,7 @@ fn stream() void {
 }
 
 pub fn main() void {
+    openConsole();
     say("mirage guest is alive\n");
     chip();
     share();

@@ -1,8 +1,11 @@
-//! A 16550 UART, enough of one for an x86 guest to print through a polled console.
+//! A 16550 UART, enough of one for an x86 guest to print through both the kernel's polled
+//! console and the interrupt-driven tty the first process writes to.
 //!
-//! Two registers carry all the work: the transmit holding register the guest writes a
-//! byte to, and the line status register it reads to know the transmitter is free. No
-//! divisor-latch emulation or interrupt routing is needed for polled early console output.
+//! The kernel's early console polls the line status and writes a byte at a time. The full
+//! driver the first process reaches instead writes a byte, enables the transmit interrupt,
+//! and waits for it before writing the next. So the transmit holding register carries the
+//! bytes, the line status says the transmitter is free, and the port raises an interrupt
+//! whenever the transmit interrupt is enabled, because the transmitter is never busy.
 
 const std = @import("std");
 const testing = @import("mirage-testing");
@@ -16,9 +19,9 @@ pub const len = 8;
 const reg = struct {
     /// Transmit holding register (write) / receive buffer register (read).
     const thr = 0;
-    /// Interrupt enable register. Accepted and ignored for polled output.
+    /// Interrupt enable register.
     const ier = 1;
-    /// Interrupt identification / FIFO control. Accepted and ignored.
+    /// Interrupt identification / FIFO control.
     const iir_fcr = 2;
     /// Line control register. Accepted and ignored.
     const lcr = 3;
@@ -28,7 +31,7 @@ const reg = struct {
     const lsr = 5;
     /// Modem status register. Accepted and ignored.
     const msr = 6;
-    /// Scratch register. Accepted and ignored.
+    /// Scratch register.
     const scr = 7;
 };
 
@@ -37,9 +40,24 @@ const reg = struct {
 /// itself ready leaves the guest spinning forever.
 const lsr_ready: u64 = 0x60;
 
+/// `UART_IER_THRI`: the guest wants an interrupt when the transmitter is free.
+const ier_thri: u8 = 0x02;
+
+/// `UART_IIR_THRI`: the identification register's code for a transmitter-empty interrupt.
+const iir_thri: u8 = 0x02;
+
+/// `UART_IIR_NO_INT`: the low bit set means nothing is pending.
+const iir_none: u8 = 0x01;
+
 sink: *std.Io.Writer,
 /// Bytes the sink would not take. A byte lost in silence is a bug that hides itself.
 dropped: u64 = 0,
+/// What the guest asked to be interrupted for. The transmitter is never busy, so the
+/// transmit bit is the whole of what matters here.
+ier: u8 = 0,
+/// Set in the scratch register, read back unchanged. The driver's probe writes a byte here
+/// and reads it to decide the port exists, so a port that forgets it looks absent.
+scratch: u8 = 0,
 
 pub fn device(self: *Uart16550, port: u64) Bus.Device {
     return .{
@@ -50,14 +68,26 @@ pub fn device(self: *Uart16550, port: u64) Bus.Device {
     };
 }
 
+/// Whether the port has an interrupt to raise. The transmitter is always free, so the only
+/// question is whether the guest asked to hear about it. The run loop reads this and moves
+/// the port's interrupt line to match.
+pub fn signalling(self: *const Uart16550) bool {
+    return self.ier & ier_thri != 0;
+}
+
 fn read(ctx: *anyopaque, offset: u64, size: Bus.Size) u64 {
     _ = size;
     const self: *Uart16550 = @ptrCast(@alignCast(ctx));
-    _ = self;
     return switch (offset) {
         reg.lsr => lsr_ready,
-        // RBR (offset 0) returns 0: no input in B1.
-        reg.thr, reg.ier, reg.iir_fcr, reg.lcr, reg.mcr, reg.msr, reg.scr => 0,
+        reg.ier => self.ier,
+        // The one interrupt this port raises is the transmitter going free. Reading the
+        // identification register is how the driver's handler learns what to service and
+        // clears it; the transmitter is free again at once, so the next read says so too.
+        reg.iir_fcr => if (self.signalling()) iir_thri else iir_none,
+        reg.scr => self.scratch,
+        // RBR (offset 0) returns 0: this port carries no input.
+        reg.thr, reg.lcr, reg.mcr, reg.msr => 0,
         else => 0,
     };
 }
@@ -69,8 +99,10 @@ fn write(ctx: *anyopaque, offset: u64, size: Bus.Size, value: u64) void {
         reg.thr => self.sink.writeByte(@truncate(value)) catch {
             self.dropped += 1;
         },
-        // IER, IIR/FCR, LCR, MCR, MSR, SCR: accepted and ignored.
-        reg.ier, reg.iir_fcr, reg.lcr, reg.mcr, reg.msr, reg.scr => {},
+        reg.ier => self.ier = @truncate(value),
+        reg.scr => self.scratch = @truncate(value),
+        // IIR/FCR, LCR, MCR, MSR: accepted and ignored.
+        reg.iir_fcr, reg.lcr, reg.mcr, reg.msr => {},
         else => {},
     }
 }

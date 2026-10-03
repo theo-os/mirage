@@ -137,9 +137,11 @@ pub const default_low: LowLayout = .{
     .gdt = 0x33000,
 };
 
-/// Fixed GPA where the initrd is placed. 64 MiB clears the kernel at 0x100000 and
-/// the decompression working set the kernel needs above it before it mounts a filesystem.
-pub const initrd_base: u64 = 0x4000000;
+/// Fixed GPA where the initrd is placed. The kernel loads at the one megabyte mark and relocates and
+/// decompresses itself into the memory above, a working set that reaches tens of megabytes for a real
+/// kernel. 256 MiB clears all of it, so the archive is still whole when the kernel unpacks it as its
+/// root rather than overwritten partway through decompression.
+pub const initrd_base: u64 = 0x1000_0000;
 
 // The e820 entry stride on disk is always 20 bytes: 8+8+4, no tail padding.
 // A Zig extern struct with those fields pads to 24, so entries are written
@@ -150,6 +152,25 @@ comptime {
 
 /// The maximum e820 entries the zero page can hold.
 const max_e820_entries = 128;
+
+/// The top of conventional low memory, 640 KiB. A PC leaves the area above this to the display and
+/// option ROMs, so a map that claims it is usable is a map the kernel does not trust.
+const low_ram_top: u64 = 0x9fc00;
+
+/// The one megabyte mark, where usable RAM begins again above the legacy hole.
+const isa_hole_top: u64 = 0x100000;
+
+/// Write one e820 entry at the next slot and advance the index. Each entry is 20 packed bytes:
+/// an eight byte address, an eight byte length, and a four byte type, which is always usable here.
+fn writeE820(memory: *GuestMemory, boot_params: u64, index: *usize, base: u64, length: u64) Error!void {
+    if (index.* >= max_e820_entries) return error.TooManyRegions;
+    var buf: [20]u8 = undefined;
+    std.mem.writeInt(u64, buf[0..8], base, .little);
+    std.mem.writeInt(u64, buf[8..16], length, .little);
+    std.mem.writeInt(u32, buf[16..20], 1, .little); // type 1: usable RAM
+    try memory.write(boot_params + 0x2d0 + index.* * 20, &buf);
+    index.* += 1;
+}
 
 /// Write the Linux zero page (boot_params) into guest RAM at low.boot_params.
 ///
@@ -200,19 +221,30 @@ pub fn buildBootParams(
     const hdr_bytes = @as([*]const u8, @ptrCast(&hdr_copy))[0..@sizeOf(SetupHeader)];
     try memory.write(low.boot_params + 0x1f1, hdr_bytes);
 
-    // Write e820_entries count at offset 0x1e8.
-    const e820_count: u8 = @intCast(n_regions);
-    try memory.write(low.boot_params + 0x1e8, &[1]u8{e820_count});
-
-    // Serialize each e820 entry as 20 packed bytes: addr(8) + size(8) + type(4).
-    for (memory.regions, 0..) |region, i| {
-        const entry_base = low.boot_params + 0x2d0 + i * 20;
-        var buf: [20]u8 = undefined;
-        std.mem.writeInt(u64, buf[0..8], region.gpa, .little);
-        std.mem.writeInt(u64, buf[8..16], region.len, .little);
-        std.mem.writeInt(u32, buf[16..20], 1, .little); // type 1: usable RAM
-        try memory.write(entry_base, &buf);
+    // Serialize the e820 map, splitting around the holes a PC leaves below the one megabyte mark.
+    // A single region that runs from zero past a megabyte covers the conventional 640 KiB boundary
+    // and the ISA area above it, and a kernel handed that one region as usable ignores the whole map
+    // and falls back to its legacy probe, which reports only 640 KiB and leaves it unable to boot. So
+    // a region that spans the boundary becomes a low entry below 640 KiB and a high entry from the one
+    // megabyte mark, with the area between left out.
+    var count: u8 = 0;
+    var i: usize = 0;
+    for (memory.regions) |region| {
+        const start = region.gpa;
+        const stop = region.gpa + region.len;
+        if (start < low_ram_top and stop > isa_hole_top) {
+            try writeE820(memory, low.boot_params, &i, start, low_ram_top - start);
+            count += 1;
+            try writeE820(memory, low.boot_params, &i, isa_hole_top, stop - isa_hole_top);
+            count += 1;
+        } else {
+            try writeE820(memory, low.boot_params, &i, start, region.len);
+            count += 1;
+        }
     }
+
+    // The entry count lives at its own offset, apart from the entries themselves.
+    try memory.write(low.boot_params + 0x1e8, &[1]u8{count});
 }
 
 test "a valid 64-bit bzImage header parses" {
@@ -308,7 +340,8 @@ test "more than 128 regions is refused" {
 }
 
 test "an initramfs is placed in guest ram and recorded in boot_params" {
-    const backing = try testing.allocator().alloc(u8, 0x8000000); // 128 MiB
+    // Past initrd_base with room for the bytes above it.
+    const backing = try testing.allocator().alloc(u8, initrd_base + 0x1000);
     defer testing.allocator().free(backing);
     @memset(backing, 0);
     var memory: GuestMemory = .{ .regions = &.{.{ .gpa = 0, .len = backing.len, .backing = .{ .shared = backing } }} };
