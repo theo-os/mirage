@@ -60,6 +60,7 @@ pub const Service = struct {
 
 pub const Gicv2 = @import("mirage-device/Gicv2.zig");
 pub const Pl011 = @import("mirage-device/Pl011.zig");
+pub const Uart16550 = @import("mirage-device/Uart16550.zig");
 pub const Tpm = @import("mirage-device/Tpm.zig");
 pub const virtio = struct {
     pub const Queue = @import("mirage-device/virtio/Queue.zig");
@@ -75,6 +76,7 @@ test {
     _ = Bus;
     _ = Gicv2;
     _ = Pl011;
+    _ = Uart16550;
     _ = Tpm;
     _ = virtio.Queue;
     _ = virtio.Mmio;
