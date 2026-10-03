@@ -21,13 +21,16 @@ pub const magic = "mirage snapshot\x00";
 
 /// The layout below. A reader refuses a version it does not know rather than reading the fields
 /// in the wrong places.
-pub const version = 2;
+pub const version = 1;
 
 pub const Error = error{
     /// The bytes do not begin with a snapshot.
     NotASnapshot,
     /// A snapshot this code has no layout for.
     UnknownVersion,
+    /// A snapshot taken on a different CPU architecture, or on a build this host does not know.
+    /// Snapshots only move between identical builds; the arch tag catches the most common mismatch.
+    ForeignArchitecture,
     /// The header describes more than the bytes hold.
     Truncated,
     /// More devices, or more CPUs, than this snapshot holds room for.
@@ -128,8 +131,12 @@ pub const Parts = struct {
     }
 };
 
-/// The fixed part at the front: the magic, the version, and the length of everything behind it.
-pub const header_size = magic.len + 4 + 8 + 8 + 8 + 8 + 4 + 4;
+/// Where the arch tag sits in the header, so tests can overwrite it directly.
+pub const arch_offset = magic.len + 4;
+
+/// The fixed part at the front: the magic, the version, the arch tag, and the length of everything
+/// behind it.
+pub const header_size = magic.len + 4 + 2 + 8 + 8 + 8 + 8 + 4 + 4;
 
 /// How many CPUs one snapshot carries. A machine with more than this is one this format cannot hold,
 /// which is better than holding some of it.
@@ -155,10 +162,15 @@ pub fn write(parts: Parts, out: []u8) Error!usize {
     const total = size(parts);
     if (out.len < total) return Error.Truncated;
 
+    const builtin = @import("builtin");
+
     @memcpy(out[0..magic.len], magic);
     var at = magic.len;
     std.mem.writeInt(u32, out[at..][0..4], version, .little);
     at += 4;
+    // The tag is self-consistent within one build; snapshots only move between identical builds.
+    std.mem.writeInt(u16, out[at..][0..2], @intFromEnum(builtin.cpu.arch), .little);
+    at += 2;
     std.mem.writeInt(u64, out[at..][0..8], parts.ram_base, .little);
     at += 8;
     std.mem.writeInt(u64, out[at..][0..8], parts.memory.len, .little);
@@ -196,9 +208,15 @@ pub fn parse(bytes: []const u8, queues: *[max_queues]QueueState) Error!Parts {
     if (bytes.len < header_size) return Error.Truncated;
     if (!std.mem.eql(u8, bytes[0..magic.len], magic)) return Error.NotASnapshot;
 
+    const builtin = @import("builtin");
+
     var at = magic.len;
     if (std.mem.readInt(u32, bytes[at..][0..4], .little) != version) return Error.UnknownVersion;
     at += 4;
+    const raw_arch = std.mem.readInt(u16, bytes[at..][0..2], .little);
+    at += 2;
+    const tag = std.enums.fromInt(std.Target.Cpu.Arch, raw_arch) orelse return Error.ForeignArchitecture;
+    if (tag != builtin.cpu.arch) return Error.ForeignArchitecture;
     const ram_base = std.mem.readInt(u64, bytes[at..][0..8], .little);
     at += 8;
     const memory_len = std.mem.readInt(u64, bytes[at..][0..8], .little);
@@ -330,12 +348,12 @@ test "a header that claims more than arrived is refused" {
 
     // The memory length says far more than the file holds. A reader that trusts it hands out a
     // slice past the end of what it was given.
-    std.mem.writeInt(u64, out[magic.len + 4 + 8 ..][0..8], 1 << 40, .little);
+    std.mem.writeInt(u64, out[magic.len + 4 + 2 + 8 ..][0..8], 1 << 40, .little);
     try testing.expectError(Error.Truncated, parse(out, &queues));
 
     // And a length that overflows when the three are added together.
-    std.mem.writeInt(u64, out[magic.len + 4 + 8 ..][0..8], std.math.maxInt(u64), .little);
-    std.mem.writeInt(u64, out[magic.len + 4 + 16 ..][0..8], 8, .little);
+    std.mem.writeInt(u64, out[magic.len + 4 + 2 + 8 ..][0..8], std.math.maxInt(u64), .little);
+    std.mem.writeInt(u64, out[magic.len + 4 + 2 + 16 ..][0..8], 8, .little);
     try testing.expectError(Error.Truncated, parse(out, &queues));
 }
 
@@ -356,6 +374,28 @@ test "more devices than this format holds is refused rather than partly held" {
     };
     var out: [4096]u8 = undefined;
     try testing.expectError(Error.TooManyDevices, write(parts, &out));
+}
+
+test "a snapshot made under another architecture is refused by name" {
+    const builtin = @import("builtin");
+    const other: std.Target.Cpu.Arch = if (builtin.cpu.arch == .x86_64) .aarch64 else .x86_64;
+
+    const parts: Parts = .{
+        .ram_base = 0,
+        .memory = &.{},
+        .registers = &.{},
+        .cpus = 1,
+        .running = &[_]u8{0},
+        .controller = &.{},
+        .queues = &.{},
+    };
+    var buffer: [512]u8 = undefined;
+    const used = try write(parts, &buffer);
+    // Overwrite the arch tag with a tag from a foreign architecture.
+    std.mem.writeInt(u16, buffer[arch_offset..][0..2], @intFromEnum(other), .little);
+
+    var queues: [max_queues]QueueState = undefined;
+    try testing.expectError(Error.ForeignArchitecture, parse(buffer[0..used], &queues));
 }
 
 test "a queue's state survives being taken out of one and put into another" {
@@ -450,7 +490,7 @@ test "a snapshot whose cpus do not divide its registers is refused" {
     _ = try write(honest, bytes);
 
     // Say three CPUs where four register bytes were written.
-    std.mem.writeInt(u32, bytes[magic.len + 4 + 8 + 8 + 8 + 8 + 4 ..][0..4], 3, .little);
+    std.mem.writeInt(u32, bytes[magic.len + 4 + 2 + 8 + 8 + 8 + 8 + 4 ..][0..4], 3, .little);
     var queues: [max_queues]QueueState = undefined;
     try testing.expectError(Error.Truncated, parse(bytes, &queues));
 }
