@@ -56,16 +56,28 @@ pub fn build(b: *std.Build) void {
         .{ .name = "dtree", .module = dtree },
         .{ .name = "mirage-device", .module = device },
     });
+    // The x86 arch module is built on every host so its tests run, even while a build
+    // for another target does not select it.
+    const x86_64 = add.lib("mirage-x86_64", &.{});
+    // One architecture, chosen by the target, exposed under the one name the backend and
+    // the core name. The concrete modules stay available where a file names an arch.
+    const arch = switch (target.result.cpu.arch) {
+        .aarch64 => arm64,
+        .x86_64 => x86_64,
+        else => @panic("mirage supports aarch64 and x86_64 hosts"),
+    };
     const backend = add.lib("mirage-backend", &.{
         .{ .name = "mirage-memory", .module = memory },
         .{ .name = "mirage-device", .module = device },
         .{ .name = "mirage-arm64", .module = arm64 },
+        .{ .name = "mirage-arch", .module = arch },
     });
     const core = add.lib("mirage-core", &.{
         .{ .name = "mirage-backend", .module = backend },
         .{ .name = "mirage-memory", .module = memory },
         .{ .name = "mirage-device", .module = device },
         .{ .name = "mirage-arm64", .module = arm64 },
+        .{ .name = "mirage-arch", .module = arch },
         .{ .name = "mirage-attest", .module = attest },
     });
     if (target.result.os.tag == .macos) {

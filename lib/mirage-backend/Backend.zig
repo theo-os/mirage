@@ -7,6 +7,7 @@
 //! difference stays here. Nothing above this interface learns which one is under it.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = @import("mirage-testing");
 
 const Backend = @This();
@@ -19,10 +20,8 @@ pub const VcpuId = u32;
 /// There is one such enum and `mirage-device` owns it.
 pub const Size = @import("mirage-device").Size;
 
-/// The registers the arm64 Linux boot protocol needs before the first instruction.
-/// The protocol requires `x1` through `x3` to be zero, so they are named here to be
-/// set rather than assumed.
-pub const Register = enum { pc, x0, x1, x2, x3 };
+/// The registers a launch names, from whichever architecture this build runs on.
+pub const Register = @import("mirage-arch").Register;
 
 pub const GuestMemory = @import("mirage-memory").GuestMemory;
 
@@ -207,16 +206,26 @@ test "completing an mmio read records the value the device produced" {
     try testing.expectEqual(@as(u64, 0x2000_0000), mock.last_completion.?);
 }
 
+/// The two registers these tests exercise, named per architecture so the mock proves
+/// the same thing on both: the program counter, and one argument register.
+const test_regs = switch (builtin.cpu.arch) {
+    .aarch64 => .{ .pc = Register.pc, .arg = Register.x0 },
+    .x86_64 => .{ .pc = Register.rip, .arg = Register.rsi },
+    else => @compileError("mirage runs on aarch64 and x86_64"),
+};
+const pc_reg = test_regs.pc;
+const arg_reg = test_regs.arg;
+
 test "a register set through the interface is the register the backend holds" {
     var mock: Mock = .init(&.{});
     var backend = mock.backend();
     const cpu = try backend.addVcpu();
 
-    try backend.setRegister(cpu, .pc, 0x4008_0000);
-    try backend.setRegister(cpu, .x0, 0x4000_0000);
+    try backend.setRegister(cpu, pc_reg, 0x4008_0000);
+    try backend.setRegister(cpu, arg_reg, 0x4000_0000);
 
-    try testing.expectEqual(@as(u64, 0x4008_0000), mock.register(cpu, .pc));
-    try testing.expectEqual(@as(u64, 0x4000_0000), mock.register(cpu, .x0));
+    try testing.expectEqual(@as(u64, 0x4008_0000), mock.register(cpu, pc_reg));
+    try testing.expectEqual(@as(u64, 0x4000_0000), mock.register(cpu, arg_reg));
 }
 
 test "each added vcpu gets its own identifier and its own registers" {
@@ -227,10 +236,10 @@ test "each added vcpu gets its own identifier and its own registers" {
     const second = try backend.addVcpu();
     try std.testing.expect(first != second);
 
-    try backend.setRegister(first, .x0, 1);
-    try backend.setRegister(second, .x0, 2);
-    try testing.expectEqual(@as(u64, 1), mock.register(first, .x0));
-    try testing.expectEqual(@as(u64, 2), mock.register(second, .x0));
+    try backend.setRegister(first, arg_reg, 1);
+    try backend.setRegister(second, arg_reg, 2);
+    try testing.expectEqual(@as(u64, 1), mock.register(first, arg_reg));
+    try testing.expectEqual(@as(u64, 2), mock.register(second, arg_reg));
 }
 
 test "a mock backend carries a port write and completes a port read" {
@@ -254,12 +263,12 @@ test "a register goes in and comes back out through the interface" {
     const hv = mock.backend();
     const id = try hv.addVcpu();
 
-    try hv.setRegister(id, .pc, 0x4008_0000);
-    try hv.setRegister(id, .x0, 0xdead_beef);
+    try hv.setRegister(id, pc_reg, 0x4008_0000);
+    try hv.setRegister(id, arg_reg, 0xdead_beef);
 
-    try testing.expectEqual(@as(u64, 0x4008_0000), try hv.getRegister(id, .pc));
-    try testing.expectEqual(@as(u64, 0xdead_beef), try hv.getRegister(id, .x0));
+    try testing.expectEqual(@as(u64, 0x4008_0000), try hv.getRegister(id, pc_reg));
+    try testing.expectEqual(@as(u64, 0xdead_beef), try hv.getRegister(id, arg_reg));
 
     // A vCPU nobody made is refused rather than read out of the array behind it.
-    try testing.expectError(Error.NoSuchVcpu, hv.getRegister(id + 1, .pc));
+    try testing.expectError(Error.NoSuchVcpu, hv.getRegister(id + 1, pc_reg));
 }

@@ -9,12 +9,14 @@
 //! that is already mapped and a `Backend` that is already open.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = @import("mirage-testing");
 const Backend = @import("mirage-backend").Backend;
 const GuestMemory = @import("mirage-memory").GuestMemory;
 const attest = @import("mirage-attest");
 const Manifest = attest.Manifest;
 const arm64 = @import("mirage-arm64");
+const arch = @import("mirage-arch");
 const device = @import("mirage-device");
 
 /// What is being started.
@@ -324,14 +326,9 @@ fn prepareFirmware(
     return .{ .entry = where.at, .device_tree = config.ram_base, .log = log };
 }
 
-/// Put the guest at its entry point. The protocol wants the device tree address in
-/// `x0` and the other three argument registers zeroed.
+/// Put the guest at its entry point, the way the architecture under this build asks.
 pub fn enter(hv: Backend, vcpu: Backend.VcpuId, layout: Layout) Backend.Error!void {
-    try hv.setRegister(vcpu, .pc, layout.entry);
-    try hv.setRegister(vcpu, .x0, layout.device_tree);
-    try hv.setRegister(vcpu, .x1, 0);
-    try hv.setRegister(vcpu, .x2, 0);
-    try hv.setRegister(vcpu, .x3, 0);
+    try arch.enter(hv, vcpu, layout);
 }
 
 pub const Reason = enum {
@@ -449,8 +446,9 @@ pub fn run(hv: Backend, vcpu: Backend.VcpuId, options: Run) RunError!Reason {
 
             // KVM answers these in the kernel and never sends one. Apple answers
             // none of them, so they are answered here and the guest cannot tell
-            // which hypervisor it is on.
-            .psci => |call| switch (arm64.psci.handle(.{ .function = call.function, .args = call.args })) {
+            // which hypervisor it is on. Only an architecture with a power interface
+            // reaches these; the x86 hypervisor never emits one.
+            .psci => |call| if (comptime arch.has_power) switch (arch.psci.handle(.{ .function = call.function, .args = call.args })) {
                 .value => |value| try hv.setRegister(vcpu, .x0, value),
                 .power_off => return .shutdown,
                 .reset => return .reset,
@@ -462,9 +460,9 @@ pub fn run(hv: Backend, vcpu: Backend.VcpuId, options: Run) RunError!Reason {
                         defer release(options);
                         break :once who.start(who.ctx, asked.target, asked.entry, asked.context);
                     } else false;
-                    try hv.setRegister(vcpu, .x0, if (answer) arm64.psci.success else arm64.psci.not_supported);
+                    try hv.setRegister(vcpu, .x0, if (answer) arch.psci.success else arch.psci.not_supported);
                 },
-            },
+            } else unreachable,
 
             // Only Apple sends this. The program counter has already moved past
             // the instruction, so the guest carries on around its idle loop and
@@ -473,12 +471,14 @@ pub fn run(hv: Backend, vcpu: Backend.VcpuId, options: Run) RunError!Reason {
 
             // Only Apple sends this too, because KVM delivers the timer interrupt
             // itself. Here the VMM has to.
-            .timer => if (options.controller) |each| {
-                take(options);
-                defer release(options);
-                // The timer belongs to this CPU and to no other, so it is raised for this one.
-                each.raiseOn(each.ctx, vcpu, arm64.timer.virtual_intid);
-            },
+            .timer => if (comptime arch.has_power) {
+                if (options.controller) |each| {
+                    take(options);
+                    defer release(options);
+                    // The timer belongs to this CPU and to no other, so it is raised for this one.
+                    each.raiseOn(each.ctx, vcpu, arch.timer.virtual_intid);
+                }
+            } else unreachable,
 
             // The guest was taken back so this loop could run. Serving the devices and
             // giving the host its turn is the whole point, and both happen below.
@@ -658,48 +658,56 @@ test "the run loop answers an mmio read with what the device gave" {
 }
 
 test "a guest asking to power off stops the loop" {
-    var mock: Backend.Mock = .init(&.{
-        .{ .psci = .{ .function = arm64.psci.function.system_off, .args = @splat(0) } },
-    });
-    const hv = mock.backend();
-    const id = try hv.addVcpu();
+    // The power interface is arm's; the x86 hypervisor never emits this exit, so the
+    // whole test is compiled out there rather than naming a register x86 does not have.
+    if (comptime !arch.has_power) return error.SkipZigTest else {
+        var mock: Backend.Mock = .init(&.{
+            .{ .psci = .{ .function = arm64.psci.function.system_off, .args = @splat(0) } },
+        });
+        const hv = mock.backend();
+        const id = try hv.addVcpu();
 
-    var devices = [_]device.Device{};
-    var bus: device.Bus = .{ .devices = &devices };
+        var devices = [_]device.Device{};
+        var bus: device.Bus = .{ .devices = &devices };
 
-    try testing.expectEqual(Reason.shutdown, try run(hv, id, .{ .bus = &bus }));
+        try testing.expectEqual(Reason.shutdown, try run(hv, id, .{ .bus = &bus }));
+    }
 }
 
 test "a guest asking for the psci version is answered and carries on" {
-    var mock: Backend.Mock = .init(&.{
-        .{ .psci = .{ .function = arm64.psci.function.version, .args = @splat(0) } },
-        .shutdown,
-    });
-    const hv = mock.backend();
-    const id = try hv.addVcpu();
+    if (comptime !arch.has_power) return error.SkipZigTest else {
+        var mock: Backend.Mock = .init(&.{
+            .{ .psci = .{ .function = arm64.psci.function.version, .args = @splat(0) } },
+            .shutdown,
+        });
+        const hv = mock.backend();
+        const id = try hv.addVcpu();
 
-    var devices = [_]device.Device{};
-    var bus: device.Bus = .{ .devices = &devices };
+        var devices = [_]device.Device{};
+        var bus: device.Bus = .{ .devices = &devices };
 
-    _ = try run(hv, id, .{ .bus = &bus });
+        _ = try run(hv, id, .{ .bus = &bus });
 
-    // The answer goes back in x0, which is where the guest looks for it.
-    try testing.expectEqual(arm64.psci.version_number, mock.register(id, .x0));
+        // The answer goes back in x0, which is where the guest looks for it.
+        try testing.expectEqual(arm64.psci.version_number, mock.register(id, .x0));
+    }
 }
 
 test "a guest asking to start a second cpu is told no rather than ignored" {
-    var mock: Backend.Mock = .init(&.{
-        .{ .psci = .{ .function = arm64.psci.function.cpu_on, .args = .{ 1, 0x4008_0000, 0 } } },
-        .shutdown,
-    });
-    const hv = mock.backend();
-    const id = try hv.addVcpu();
+    if (comptime !arch.has_power) return error.SkipZigTest else {
+        var mock: Backend.Mock = .init(&.{
+            .{ .psci = .{ .function = arm64.psci.function.cpu_on, .args = .{ 1, 0x4008_0000, 0 } } },
+            .shutdown,
+        });
+        const hv = mock.backend();
+        const id = try hv.addVcpu();
 
-    var devices = [_]device.Device{};
-    var bus: device.Bus = .{ .devices = &devices };
+        var devices = [_]device.Device{};
+        var bus: device.Bus = .{ .devices = &devices };
 
-    _ = try run(hv, id, .{ .bus = &bus });
-    try testing.expectEqual(arm64.psci.not_supported, mock.register(id, .x0));
+        _ = try run(hv, id, .{ .bus = &bus });
+        try testing.expectEqual(arm64.psci.not_supported, mock.register(id, .x0));
+    }
 }
 
 test "the interrupt line follows what the controller says" {
@@ -742,6 +750,10 @@ test "the interrupt line is released when the controller has nothing waiting" {
 }
 
 test "a timer exit becomes the timer interrupt in the controller" {
+    // Only an architecture with its timer in the VMM reaches this exit; x86's is in the
+    // hypervisor.
+    if (comptime !arch.has_power) return error.SkipZigTest;
+
     var gic: device.Gicv2 = .{};
     var on_bus = gic.devices(0x0800_0000, 0x0801_0000);
     var bus: device.Bus = .{ .devices = &on_bus };

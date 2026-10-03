@@ -19,9 +19,11 @@ pub const kvm = switch (builtin.os.tag) {
         pub const ioctl = @import("mirage-backend/linux/kvm/ioctl.zig");
         pub const probe = @import("mirage-backend/linux/kvm/probe.zig");
         pub const Vm = @import("mirage-backend/linux/kvm/Vm.zig");
-        pub const Vcpu = @import("mirage-backend/linux/kvm/Vcpu.zig");
+        pub const Vcpu = @import("mirage-backend/linux/kvm/Vcpu.zig").Vcpu;
         pub const Machine = @import("mirage-backend/linux/kvm/Machine.zig");
-        pub const Gic = @import("mirage-backend/linux/kvm/Gic.zig");
+        // The interrupt controller is arm's. An x86 build keeps it out so nothing drags
+        // in `mirage-arm64`.
+        pub const Gic = if (builtin.cpu.arch == .aarch64) @import("mirage-backend/linux/kvm/Gic.zig") else void;
     },
     else => void,
 };
@@ -38,6 +40,6 @@ test {
         _ = kvm.Vm;
         _ = kvm.Vcpu;
         _ = kvm.Machine;
-        _ = kvm.Gic;
+        if (builtin.cpu.arch == .aarch64) _ = kvm.Gic;
     }
 }
