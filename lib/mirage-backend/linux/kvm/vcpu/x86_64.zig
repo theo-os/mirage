@@ -138,6 +138,9 @@ const max_cpuid_entries = 128;
 const Cpuid2Buffer = extern struct {
     header: Cpuid2Header,
     entries: [max_cpuid_entries]CpuidEntry2,
+    comptime {
+        if (@sizeOf(@This()) != 8 + max_cpuid_entries * 40) @compileError("kvm_cpuid2 buffer is the header plus its entries");
+    }
 };
 
 pub const Run = shared.Run;
@@ -184,11 +187,21 @@ fn loadCpuid(kvm_fd: std.posix.fd_t, vcpu_fd: std.posix.fd_t) Error!void {
         .header = .{ .nent = max_cpuid_entries, .padding = 0 },
         .entries = undefined,
     };
-    _ = try ioctl.call(
+
+    // Offer room for every leaf and let the kernel write back how many it used. This ioctl
+    // says `E2BIG` without reporting a count, so a host with more leaves than this buffer
+    // holds is named rather than silently truncated.
+    _ = ioctl.call(
         kvm_fd,
         comptime ioctl.request(.read_write, Cpuid2Header, nr.get_supported_cpuid),
         @intFromPtr(&buf),
-    );
+    ) catch |err| switch (err) {
+        error.TooBig => return Error.TooBig,
+        else => return err,
+    };
+
+    // The ioctl number is built from the 8-byte header type on purpose; the pointer is the
+    // full buffer. The entries the read filled in follow the header the kernel reads back.
     _ = try ioctl.call(
         vcpu_fd,
         comptime ioctl.request(.write, Cpuid2Header, nr.set_cpuid2),
