@@ -301,6 +301,16 @@ test "more than 128 regions is refused" {
 pub const code_selector: u16 = 0x08;
 pub const data_selector: u16 = 0x10;
 
+/// Put an x86 guest into long mode at its entry.
+///
+/// x86 needs full control and segment register state to start, not the few general
+/// registers the arm boot entry sets, so the boot entry is its own seam here. The vCPU is
+/// passed in rather than imported, so this stays below the backend; it establishes the
+/// state `buildLongMode` left the tables and the GDT ready for.
+pub fn enter(vcpu: anytype, layout: Layout) !void {
+    try vcpu.enterLongMode(default_low.pml4, layout.entry, layout.device_tree, default_low.gdt);
+}
+
 /// Build a 4-level identity-map paging hierarchy (PML4 → PDPT → PD) using
 /// 2MB pages covering the first gigabyte, then write a minimal GDT.
 ///

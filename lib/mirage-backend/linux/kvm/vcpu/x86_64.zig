@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const testing = @import("mirage-testing");
+const arch = @import("mirage-arch");
 const Backend = @import("../../../Backend.zig");
 const Vm = @import("../Vm.zig");
 const ioctl = @import("../ioctl.zig");
@@ -366,6 +367,75 @@ fn enterFlatMode(vcpu_fd: std.posix.fd_t) Error!void {
         comptime ioctl.request(.write, Sregs, nr.set_sregs),
         @intFromPtr(&sregs),
     );
+}
+
+/// A 64-bit code segment: the long-mode bit set, byte granular limit, present and executable.
+const cs_long: Segment = .{
+    .base = 0,
+    .limit = 0xffff_ffff,
+    .selector = arch.boot.code_selector,
+    .kind = 0xb, // executable, readable, accessed
+    .present = 1,
+    .dpl = 0,
+    .db = 0, // must be clear while L is set
+    .s = 1,
+    .l = 1,
+    .g = 1,
+    .avl = 0,
+    .unusable = 0,
+    .padding = 0,
+};
+
+/// A data segment for long mode: flat, read/write, 32-bit default size.
+const ds_long: Segment = .{
+    .base = 0,
+    .limit = 0xffff_ffff,
+    .selector = arch.boot.data_selector,
+    .kind = 0x3, // read/write, accessed
+    .present = 1,
+    .dpl = 0,
+    .db = 1,
+    .s = 1,
+    .l = 0,
+    .g = 1,
+    .avl = 0,
+    .unusable = 0,
+    .padding = 0,
+};
+
+/// Put the vCPU in 64-bit long mode and place it at its entry.
+///
+/// The page tables, the GDT, and the entry all live in guest RAM the caller has already
+/// filled. A wrong control bit or a code segment without the long-mode bit triple-faults
+/// the guest the moment it runs.
+pub fn enterLongMode(self: *Vcpu, cr3: u64, entry: u64, boot_params: u64, gdt: u64) Error!void {
+    var sregs: Sregs = undefined;
+    _ = try ioctl.call(self.fd, comptime ioctl.request(.read, Sregs, nr.get_sregs), @intFromPtr(&sregs));
+
+    sregs.cs = cs_long;
+    sregs.ds = ds_long;
+    sregs.es = ds_long;
+    sregs.ss = ds_long;
+    sregs.fs = ds_long;
+    sregs.gs = ds_long;
+
+    // PE | PG, PAE, and LME | LMA together are the state a CPU holds once it is in long mode.
+    sregs.cr0 = 0x8000_0001;
+    sregs.cr4 = 0x20;
+    sregs.efer = 0x500;
+    sregs.cr3 = cr3;
+
+    // Three eight-byte descriptors: null, code, data.
+    sregs.gdt = .{ .base = gdt, .limit = 23, .padding = @splat(0) };
+
+    _ = try ioctl.call(self.fd, comptime ioctl.request(.write, Sregs, nr.set_sregs), @intFromPtr(&sregs));
+
+    var regs: Regs = undefined;
+    _ = try ioctl.call(self.fd, comptime ioctl.request(.read, Regs, nr.get_regs), @intFromPtr(&regs));
+    regs.rip = entry;
+    regs.rsi = boot_params; // the zero page pointer the 64-bit entry reads
+    regs.rflags = 0x2; // bit one is always set
+    _ = try ioctl.call(self.fd, comptime ioctl.request(.write, Regs, nr.set_regs), @intFromPtr(&regs));
 }
 
 pub fn deinit(self: *Vcpu) void {
@@ -749,6 +819,33 @@ test "an x86 in instruction takes the value the host completes" {
     // Second exit: the guest echoed the value back out, proving 0x5a reached AL.
     try testing.expectEqual(Backend.Exit{
         .port_out = .{ .port = 0xe9, .size = .byte, .value = 0x5a },
+    }, try cpu.run());
+}
+
+test "a long-mode x86 guest runs and writes a port" {
+    var vm = try openVm();
+    defer vm.deinit();
+
+    // One region spans the page tables, the GDT, and the entry so every GPA the guest
+    // touches on the way into long mode is backed.
+    const span = 0x200000;
+    const region = try vm.addMemory(0, span, .shared);
+    var memory: Backend.GuestMemory = .{ .regions = &.{region} };
+
+    const low = arch.boot.default_low;
+    try arch.boot.buildLongMode(&memory, low, span);
+
+    // mov al,0x4d ; out 0xe9,al ; jmp $ — placed inside the 2 MB page the PD identity-maps.
+    const entry = 0x100000;
+    const code = [_]u8{ 0xb0, 0x4d, 0xe6, 0xe9, 0xeb, 0xfe };
+    try memory.write(entry, &code);
+
+    var cpu = try Vcpu.create(&vm, 0);
+    defer cpu.deinit();
+
+    try cpu.enterLongMode(low.pml4, entry, low.boot_params, low.gdt);
+    try testing.expectEqual(Backend.Exit{
+        .port_out = .{ .port = 0xe9, .size = .byte, .value = 0x4d },
     }, try cpu.run());
 }
 
