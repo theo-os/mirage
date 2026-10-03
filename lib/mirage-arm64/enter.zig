@@ -5,10 +5,16 @@
 //! so this stays below the backend that names this architecture. Only the layout's entry
 //! and device tree addresses are read.
 
+const boot = @import("boot.zig");
+
 pub fn enter(hv: anytype, vcpu: anytype, layout: anytype) !void {
-    try hv.setRegister(vcpu, .pc, layout.entry);
-    try hv.setRegister(vcpu, .x0, layout.device_tree);
-    try hv.setRegister(vcpu, .x1, 0);
-    try hv.setRegister(vcpu, .x2, 0);
-    try hv.setRegister(vcpu, .x3, 0);
+    const Shim = struct {
+        hv: @TypeOf(hv),
+        vcpu: @TypeOf(vcpu),
+
+        fn setRegister(self: @This(), reg: anytype, val: u64) !void {
+            try self.hv.setRegister(self.vcpu, reg, val);
+        }
+    };
+    try boot.enter(Shim{ .hv = hv, .vcpu = vcpu }, layout);
 }
