@@ -291,3 +291,109 @@ test "more than 128 regions is refused" {
 
     try testing.expectError(error.TooManyRegions, buildBootParams(&memory, header, "x", null, default_low));
 }
+
+/// GDT selectors matching the descriptors written by buildLongMode.
+pub const code_selector: u16 = 0x08;
+pub const data_selector: u16 = 0x10;
+
+/// Build a 4-level identity-map paging hierarchy (PML4 → PDPT → PD) using
+/// 2MB pages covering the first gigabyte, then write a minimal GDT.
+///
+/// For B1 the identity map is capped at 1 GB; a single PD (512 entries × 2 MB)
+/// covers that range, which is enough to start the kernel.
+pub fn buildLongMode(
+    memory: *GuestMemory,
+    low: LowLayout,
+    map_bytes: u64,
+) Error!void {
+    // Cap the map at 1 GB so it fits within one PD (512 × 2 MB entries).
+    const cap: u64 = 0x40000000;
+    const covered = @min(map_bytes, cap);
+
+    // PML4[0] → PDPT, present | rw.
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, low.pdpt | 0x3, .little);
+    try memory.write(low.pml4, &buf);
+
+    // PDPT[0] → PD, present | rw.
+    std.mem.writeInt(u64, &buf, low.pd | 0x3, .little);
+    try memory.write(low.pdpt, &buf);
+
+    // PD entries: each covers 2 MB with present | rw | ps (0x83).
+    const n_pages = (covered + 0x1fffff) / 0x200000; // ceil(covered / 2MB)
+    const max_pd_entries: u64 = 512;
+    const n = @min(n_pages, max_pd_entries);
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        const pde = (i * 0x200000) | 0x83;
+        std.mem.writeInt(u64, &buf, pde, .little);
+        try memory.write(low.pd + i * 8, &buf);
+    }
+
+    // GDT: null descriptor, 64-bit code, 32-bit data.
+    const gdt = [3]u64{
+        0x0000000000000000, // null
+        0x00AF9A000000FFFF, // 64-bit code: L=1, present, exec/read
+        0x00CF92000000FFFF, // data: present, read/write
+    };
+    for (gdt, 0..) |entry, idx| {
+        std.mem.writeInt(u64, &buf, entry, .little);
+        try memory.write(low.gdt + idx * 8, &buf);
+    }
+}
+
+// Read a u64 little-endian from guest memory; panics on I/O error in tests.
+fn readU64(memory: *const GuestMemory, gpa: u64) u64 {
+    var buf: [8]u8 = undefined;
+    memory.read(gpa, &buf) catch unreachable;
+    return std.mem.readInt(u64, &buf, .little);
+}
+
+test "the page tables identity-map low memory with 2mb pages" {
+    // One region covers the full first gigabyte so all table GPAs are reachable.
+    const backing = try testing.allocator.alloc(u8, 0x40000000);
+    defer testing.allocator.free(backing);
+    @memset(backing, 0);
+    var regions = [_]GuestMemory.Region{.{ .gpa = 0, .len = 0x40000000, .backing = .{ .shared = backing } }};
+    var memory: GuestMemory = .{ .regions = &regions };
+    const low = default_low;
+
+    try buildLongMode(&memory, low, 0x40000000);
+
+    // PML4[0] must be present, writable, and point at the PDPT.
+    const pml4e = readU64(&memory, low.pml4 + 0);
+    try testing.expect(pml4e & 0x1 != 0);
+    try testing.expectEqual(low.pdpt, pml4e & ~@as(u64, 0xfff));
+
+    // PDPT[0] must point at the PD.
+    const pdpte = readU64(&memory, low.pdpt + 0);
+    try testing.expectEqual(low.pd, pdpte & ~@as(u64, 0xfff));
+
+    // PD[0]: present, writable, page-size (maps physical 0).
+    const pde0 = readU64(&memory, low.pd + 0);
+    try testing.expect(pde0 & 0x81 == 0x81);
+    try testing.expectEqual(@as(u64, 0), pde0 & 0xffffffffffe00000);
+
+    // PD[1]: maps 0x200000.
+    const pde1 = readU64(&memory, low.pd + 8);
+    try testing.expectEqual(@as(u64, 0x200000), pde1 & 0xffffffffffe00000);
+}
+
+test "the gdt has a 64-bit code and a data descriptor" {
+    const backing = try testing.allocator.alloc(u8, 0x40000000);
+    defer testing.allocator.free(backing);
+    @memset(backing, 0);
+    var regions = [_]GuestMemory.Region{.{ .gpa = 0, .len = 0x40000000, .backing = .{ .shared = backing } }};
+    var memory: GuestMemory = .{ .regions = &regions };
+    const low = default_low;
+
+    try buildLongMode(&memory, low, 0x200000);
+
+    // Code descriptor at GDT[1] (offset +8): L bit is bit 53, must be set.
+    const code = readU64(&memory, low.gdt + 8);
+    try testing.expect((code >> 53) & 1 == 1);
+
+    // Data descriptor at GDT[2] (offset +16): present bit (bit 47) must be set.
+    const data = readU64(&memory, low.gdt + 16);
+    try testing.expect((data >> 47) & 1 == 1);
+}
