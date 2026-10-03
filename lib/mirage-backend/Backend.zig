@@ -40,6 +40,10 @@ pub const Exit = union(enum) {
     interrupted,
     shutdown,
     reset,
+    /// x86 guest wrote a byte, word, or dword to a port. aarch64 never produces this.
+    port_out: struct { port: u16, size: Size, value: u64 },
+    /// x86 guest read from a port; complete it with completeMmioRead. aarch64 never produces this.
+    port_in: struct { port: u16, size: Size },
 };
 
 pub const Error = error{
@@ -227,6 +231,19 @@ test "each added vcpu gets its own identifier and its own registers" {
     try backend.setRegister(second, .x0, 2);
     try testing.expectEqual(@as(u64, 1), mock.register(first, .x0));
     try testing.expectEqual(@as(u64, 2), mock.register(second, .x0));
+}
+
+test "a mock backend carries a port write and completes a port read" {
+    var mock: Mock = .init(&.{
+        .{ .port_out = .{ .port = 0x3f8, .size = .byte, .value = 'M' } },
+        .{ .port_in = .{ .port = 0x3f8, .size = .byte } },
+    });
+    var backend = mock.backend();
+    const cpu = try backend.addVcpu();
+    try testing.expectEqual(Exit{ .port_out = .{ .port = 0x3f8, .size = .byte, .value = 'M' } }, try backend.run(cpu));
+    try testing.expectEqual(Exit{ .port_in = .{ .port = 0x3f8, .size = .byte } }, try backend.run(cpu));
+    try backend.completeMmioRead(cpu, 0x5a);
+    try testing.expectEqual(@as(?u64, 0x5a), mock.last_completion);
 }
 
 test "a register goes in and comes back out through the interface" {

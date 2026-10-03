@@ -483,6 +483,9 @@ pub fn run(hv: Backend, vcpu: Backend.VcpuId, options: Run) RunError!Reason {
             // The guest was taken back so this loop could run. Serving the devices and
             // giving the host its turn is the whole point, and both happen below.
             .interrupted => {},
+
+            // Device port wiring for x86 arrives later; an unexpected PIO here is a fault.
+            .port_in, .port_out => return Backend.Error.HypervisorFault,
         }
 
         // The host gets its turn before the devices are served, so anything it hands to
