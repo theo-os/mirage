@@ -22,6 +22,14 @@ const nr = struct {
     const set_regs = 0x82;
     const get_sregs = 0x83;
     const set_sregs = 0x84;
+    const get_lapic = 0x8e;
+    const set_lapic = 0x8f;
+    const get_mp_state = 0x98;
+    const set_mp_state = 0x99;
+    const get_vcpu_events = 0x9f;
+    const set_vcpu_events = 0xa0;
+    const get_xsave = 0xa4;
+    const set_xsave = 0xa5;
     const set_cpuid2 = 0x90;
     const get_supported_cpuid = 0x05;
 };
@@ -105,6 +113,95 @@ const Sregs = extern struct {
         if (@sizeOf(@This()) != 312) @compileError("kvm_sregs is 312 bytes");
     }
 };
+
+/// `struct kvm_xsave` — the extended processor state region (SSE, AVX, etc.).
+const Xsave = extern struct {
+    region: [1024]u32,
+    comptime {
+        if (@sizeOf(@This()) != 4096) @compileError("kvm_xsave is 1024 u32 = 4096 bytes");
+    }
+};
+
+/// `struct kvm_mp_state` — whether this CPU is running or halted.
+const MpState = extern struct {
+    state: u32,
+    comptime {
+        if (@sizeOf(@This()) != 4) @compileError("kvm_mp_state is 4 bytes");
+    }
+};
+
+/// `KVM_MP_STATE_RUNNABLE` — the CPU is executing guest code.
+pub const runnable: u32 = 0;
+/// `KVM_MP_STATE_STOPPED` — the CPU is not executing; used by APs before SIPI.
+pub const stopped: u32 = 5;
+
+/// `struct kvm_vcpu_events` — pending exceptions, interrupts, NMI, SMI, and related flags.
+/// Layout mirrors `asm/kvm.h` exactly: the 56-byte prefix lands at a natural u64 boundary.
+const VcpuEvents = extern struct {
+    // exception (8 bytes)
+    exc_injected: u8,
+    exc_nr: u8,
+    exc_has_error_code: u8,
+    exc_pending: u8,
+    exc_error_code: u32,
+    // interrupt (4 bytes)
+    int_injected: u8,
+    int_nr: u8,
+    int_soft: u8,
+    int_shadow: u8,
+    // nmi (4 bytes)
+    nmi_injected: u8,
+    nmi_pending: u8,
+    nmi_masked: u8,
+    nmi_pad: u8,
+    // sipi / flags (8 bytes)
+    sipi_vector: u32,
+    flags: u32,
+    // smi (4 bytes)
+    smi_smm: u8,
+    smi_pending: u8,
+    smi_smm_inside_nmi: u8,
+    smi_latched_init: u8,
+    // triple_fault.pending (1 byte) + reserved[26] + exception_has_payload (1 byte) = 28 bytes
+    // total prefix: 8+4+4+8+4+28 = 56, which aligns exception_payload to offset 56
+    triple_fault_pending: u8,
+    reserved: [26]u8,
+    exception_has_payload: u8,
+    exception_payload: u64,
+    comptime {
+        if (@sizeOf(@This()) != 64) @compileError("kvm_vcpu_events must be 64 bytes");
+    }
+};
+
+/// `struct kvm_lapic_state` — the local APIC register page (1024 bytes).
+const LapicState = extern struct {
+    regs: [1024]u8,
+    comptime {
+        if (@sizeOf(@This()) != 1024) @compileError("kvm_lapic_state is 1024 bytes");
+    }
+};
+
+/// Snapshot blob: each sub-state is framed as [tag:u8][len:u32 LE][bytes].
+/// The sequence is fixed for x86 — there is no register-id list.
+const frame_overhead = 5; // 1 byte tag + 4 bytes length
+
+const Tag = struct {
+    const regs: u8 = 0x81;
+    const sregs: u8 = 0x83;
+    const xsave: u8 = 0xa4;
+    const mp_state: u8 = 0x98;
+    const vcpu_events: u8 = 0x9f;
+    const lapic: u8 = 0x8e;
+};
+
+/// Fixed byte count every x86 vCPU snapshot needs.
+const blob_size: usize =
+    frame_overhead + @sizeOf(Regs) +
+    frame_overhead + @sizeOf(Sregs) +
+    frame_overhead + @sizeOf(Xsave) +
+    frame_overhead + @sizeOf(MpState) +
+    frame_overhead + @sizeOf(VcpuEvents) +
+    frame_overhead + @sizeOf(LapicState);
 
 /// `struct kvm_cpuid_entry2` — one leaf the kernel will answer for the guest.
 const CpuidEntry2 = extern struct {
@@ -386,22 +483,85 @@ fn decode(self: *Vcpu) Error!Backend.Exit {
     };
 }
 
+/// Whether this CPU is running or halted, via KVM_GET_MP_STATE.
 pub fn runState(self: *Vcpu) Error!u32 {
-    _ = self;
-    return Error.NotSupported;
+    var state: MpState = .{ .state = 0 };
+    _ = try ioctl.call(self.fd, comptime ioctl.request(.read, MpState, nr.get_mp_state), @intFromPtr(&state));
+    return state.state;
 }
 
+/// Set the run state via KVM_SET_MP_STATE.
 pub fn setRunState(self: *Vcpu, value: u32) Error!void {
-    _ = self;
-    _ = value;
-    return Error.NotSupported;
+    var state: MpState = .{ .state = value };
+    _ = try ioctl.call(self.fd, comptime ioctl.request(.write, MpState, nr.set_mp_state), @intFromPtr(&state));
 }
 
-pub fn save(self: *Vcpu, ids: []const u64, into: []u8) Error!usize {
+/// x86 enumerates its state internally through fixed sub-states, not through an id list.
+/// The count is always zero; the caller allocates no id buffer.
+pub fn registerCount(self: *Vcpu) Error!u64 {
     _ = self;
+    return 0;
+}
+
+/// x86 has no register-id list; returns an empty slice.
+pub fn registerList(self: *Vcpu, buffer: []u64) Error![]const u64 {
+    _ = self;
+    return buffer[0..0];
+}
+
+/// Write a frame header into `into[at..]` and advance `at`.
+fn writeFrame(into: []u8, at: *usize, tag: u8, len: usize) void {
+    into[at.*] = tag;
+    at.* += 1;
+    std.mem.writeInt(u32, into[at.*..][0..4], @intCast(len), .little);
+    at.* += 4;
+}
+
+/// Capture all vCPU sub-states into `into` as a fixed framed blob.
+/// The `ids` parameter is unused on x86; the blob format is fixed.
+pub fn save(self: *Vcpu, ids: []const u64, into: []u8) Error!usize {
     _ = ids;
-    _ = into;
-    return Error.NotSupported;
+    if (into.len < blob_size) return Error.TooBig;
+
+    var at: usize = 0;
+
+    var regs: Regs = undefined;
+    _ = try ioctl.call(self.fd, comptime ioctl.request(.read, Regs, nr.get_regs), @intFromPtr(&regs));
+    writeFrame(into, &at, Tag.regs, @sizeOf(Regs));
+    @memcpy(into[at..][0..@sizeOf(Regs)], std.mem.asBytes(&regs));
+    at += @sizeOf(Regs);
+
+    var sregs: Sregs = undefined;
+    _ = try ioctl.call(self.fd, comptime ioctl.request(.read, Sregs, nr.get_sregs), @intFromPtr(&sregs));
+    writeFrame(into, &at, Tag.sregs, @sizeOf(Sregs));
+    @memcpy(into[at..][0..@sizeOf(Sregs)], std.mem.asBytes(&sregs));
+    at += @sizeOf(Sregs);
+
+    var xsave: Xsave = undefined;
+    _ = try ioctl.call(self.fd, comptime ioctl.request(.read, Xsave, nr.get_xsave), @intFromPtr(&xsave));
+    writeFrame(into, &at, Tag.xsave, @sizeOf(Xsave));
+    @memcpy(into[at..][0..@sizeOf(Xsave)], std.mem.asBytes(&xsave));
+    at += @sizeOf(Xsave);
+
+    var mp: MpState = .{ .state = 0 };
+    _ = try ioctl.call(self.fd, comptime ioctl.request(.read, MpState, nr.get_mp_state), @intFromPtr(&mp));
+    writeFrame(into, &at, Tag.mp_state, @sizeOf(MpState));
+    @memcpy(into[at..][0..@sizeOf(MpState)], std.mem.asBytes(&mp));
+    at += @sizeOf(MpState);
+
+    var events: VcpuEvents = undefined;
+    _ = try ioctl.call(self.fd, comptime ioctl.request(.read, VcpuEvents, nr.get_vcpu_events), @intFromPtr(&events));
+    writeFrame(into, &at, Tag.vcpu_events, @sizeOf(VcpuEvents));
+    @memcpy(into[at..][0..@sizeOf(VcpuEvents)], std.mem.asBytes(&events));
+    at += @sizeOf(VcpuEvents);
+
+    var lapic: LapicState = undefined;
+    _ = try ioctl.call(self.fd, comptime ioctl.request(.read, LapicState, nr.get_lapic), @intFromPtr(&lapic));
+    writeFrame(into, &at, Tag.lapic, @sizeOf(LapicState));
+    @memcpy(into[at..][0..@sizeOf(LapicState)], std.mem.asBytes(&lapic));
+    at += @sizeOf(LapicState);
+
+    return at;
 }
 
 pub const Restored = struct {
@@ -409,11 +569,100 @@ pub const Restored = struct {
     refused: usize,
 };
 
+/// Restore vCPU sub-states from a blob written by `save`.
+/// A SET the kernel refuses is counted rather than fatal; a frame that runs past the blob
+/// is a fault the caller passed bad data for.
 pub fn load(self: *Vcpu, from: []const u8) Error!Restored {
-    _ = self;
-    _ = from;
-    return Error.NotSupported;
+    var at: usize = 0;
+    var result: Restored = .{ .written = 0, .refused = 0 };
+
+    while (at < from.len) {
+        // A frame needs at least a tag byte and a 4-byte length.
+        if (at + 5 > from.len) return Error.InvalidArgument;
+        const tag = from[at];
+        at += 1;
+        const len: usize = std.mem.readInt(u32, from[at..][0..4], .little);
+        at += 4;
+        // A frame whose payload runs past the blob is an error, not a soft refusal.
+        if (at + len > from.len) return Error.InvalidArgument;
+        const payload = from[at..][0..len];
+        at += len;
+
+        const refused = switch (tag) {
+            Tag.regs => blk: {
+                if (len != @sizeOf(Regs)) break :blk true;
+                var s: Regs = undefined;
+                @memcpy(std.mem.asBytes(&s), payload);
+                _ = ioctl.call(self.fd, comptime ioctl.request(.write, Regs, nr.set_regs), @intFromPtr(&s)) catch {
+                    break :blk true;
+                };
+                break :blk false;
+            },
+            Tag.sregs => blk: {
+                if (len != @sizeOf(Sregs)) break :blk true;
+                var s: Sregs = undefined;
+                @memcpy(std.mem.asBytes(&s), payload);
+                _ = ioctl.call(self.fd, comptime ioctl.request(.write, Sregs, nr.set_sregs), @intFromPtr(&s)) catch {
+                    break :blk true;
+                };
+                break :blk false;
+            },
+            Tag.xsave => blk: {
+                if (len != @sizeOf(Xsave)) break :blk true;
+                var s: Xsave = undefined;
+                @memcpy(std.mem.asBytes(&s), payload);
+                _ = ioctl.call(self.fd, comptime ioctl.request(.write, Xsave, nr.set_xsave), @intFromPtr(&s)) catch {
+                    break :blk true;
+                };
+                break :blk false;
+            },
+            Tag.mp_state => blk: {
+                if (len != @sizeOf(MpState)) break :blk true;
+                var s: MpState = undefined;
+                @memcpy(std.mem.asBytes(&s), payload);
+                _ = ioctl.call(self.fd, comptime ioctl.request(.write, MpState, nr.set_mp_state), @intFromPtr(&s)) catch {
+                    break :blk true;
+                };
+                break :blk false;
+            },
+            Tag.vcpu_events => blk: {
+                if (len != @sizeOf(VcpuEvents)) break :blk true;
+                var s: VcpuEvents = undefined;
+                @memcpy(std.mem.asBytes(&s), payload);
+                _ = ioctl.call(self.fd, comptime ioctl.request(.write, VcpuEvents, nr.set_vcpu_events), @intFromPtr(&s)) catch {
+                    break :blk true;
+                };
+                break :blk false;
+            },
+            Tag.lapic => blk: {
+                if (len != @sizeOf(LapicState)) break :blk true;
+                var s: LapicState = undefined;
+                @memcpy(std.mem.asBytes(&s), payload);
+                _ = ioctl.call(self.fd, comptime ioctl.request(.write, LapicState, nr.set_lapic), @intFromPtr(&s)) catch {
+                    break :blk true;
+                };
+                break :blk false;
+            },
+            // An unknown tag is counted as refused, not fatal.
+            else => true,
+        };
+        if (refused) {
+            result.refused += 1;
+        } else {
+            result.written += 1;
+        }
+    }
+    return result;
 }
+
+pub const State = struct {
+    /// The blob size is fixed for x86; the buffer argument is unused.
+    pub fn size(cpu: *Vcpu, buffer: []u64) Error!usize {
+        _ = cpu;
+        _ = buffer;
+        return blob_size;
+    }
+};
 
 const ram = 0x4000_0000;
 
@@ -500,4 +749,23 @@ test "an x86 in instruction takes the value the host completes" {
     try testing.expectEqual(Backend.Exit{
         .port_out = .{ .port = 0xe9, .size = .byte, .value = 0x5a },
     }, try cpu.run());
+}
+
+test "everything an x86 vcpu holds goes out and comes back" {
+    var vm = try openVm();
+    defer vm.deinit();
+    var cpu = try Vcpu.create(&vm, 0);
+    defer cpu.deinit();
+    try cpu.setRegister(.rip, 0x4008_0000);
+    try cpu.setRegister(.rsi, 0xfeed_face);
+
+    var blob: [8192]u8 = undefined;
+    const used = try cpu.save(&.{}, &blob);
+
+    try cpu.setRegister(.rip, 0x1000);
+    try cpu.setRegister(.rsi, 0);
+    _ = try cpu.load(blob[0..used]);
+
+    try testing.expectEqual(@as(u64, 0x4008_0000), try cpu.getRegister(.rip));
+    try testing.expectEqual(@as(u64, 0xfeed_face), try cpu.getRegister(.rsi));
 }
