@@ -13,6 +13,7 @@ const std = @import("std");
 const testing = @import("mirage-testing");
 const GuestMemory = @import("mirage-memory").GuestMemory;
 const ioctl = @import("ioctl.zig");
+const probe = @import("probe.zig");
 const linux = std.os.linux;
 
 const Vm = @This();
@@ -196,13 +197,22 @@ test "a shared region can be written and read back through guest memory" {
     try testing.expectEqualSlices(u8, "mirage", &out);
 }
 
-test "a private region is refused where the kernel cannot fault private pages" {
+test "a private region is refused only where the kernel cannot back private pages" {
     var vm = try open();
     defer vm.deinit();
 
-    // See the probe for the measurement behind this. Mirage refuses by name instead
-    // of quietly giving back memory the VMM can read.
-    try testing.expectError(error.PrivateMemoryUnsupported, vm.addMemory(base, pages(4), .private));
+    const report = probe.host() catch |err| switch (err) {
+        error.NoKvm => return error.SkipZigTest,
+        else => return err,
+    };
+    if (report.private_backs_memory) {
+        // This kernel accepts a guest_memfd slot; the private path succeeds.
+        const region = try vm.addMemory(base, pages(4), .private);
+        try testing.expectEqual(base, region.gpa);
+    } else {
+        // No memory attributes: the kernel refuses a slot the VMM cannot fault.
+        try testing.expectError(error.PrivateMemoryUnsupported, vm.addMemory(base, pages(4), .private));
+    }
 }
 
 test "each added region takes the next slot number" {
@@ -218,8 +228,8 @@ test "a region that is not a whole number of host pages is refused" {
     var vm = try open();
     defer vm.deinit();
 
-    // 4096 is a page on most hosts and is not a page on this one.
-    try testing.expectError(error.Misaligned, vm.addMemory(base, 4096, .shared));
+    // One byte past a full page is never a whole number of pages on any host.
+    try testing.expectError(error.Misaligned, vm.addMemory(base, std.heap.pageSize() + 1, .shared));
     try testing.expectError(error.Misaligned, vm.addMemory(base + 1, pages(1), .shared));
 }
 
