@@ -3,7 +3,7 @@
 const std = @import("std");
 const backend = @import("mirage-backend");
 const core = @import("mirage-core");
-const arm64 = @import("mirage-arm64");
+const arch = @import("mirage-arch");
 const device = @import("mirage-device");
 const image = @import("mirage-image");
 const netmod = @import("mirage-net");
@@ -169,7 +169,7 @@ fn saveTo(
     out: *std.Io.Writer,
     path: []const u8,
     machine: *backend.kvm.Machine,
-    gic: *backend.kvm.Gic,
+    gic: *backend.platform.Controller,
     memory: *GuestMemory,
     ram_size: u64,
     ids_of: []const backend.Backend.VcpuId,
@@ -203,7 +203,7 @@ fn saveTo(
         running[index] = @intFromBool(try cpu.runState() == backend.kvm.Vcpu.runnable);
     }
 
-    const controller = try gpa.alloc(u8, backend.kvm.Gic.State.size(@intCast(ids_of.len)));
+    const controller = try gpa.alloc(u8, backend.platform.Controller.State.size(@intCast(ids_of.len)));
     defer gpa.free(controller);
     const controller_bytes = try gic.save(@intCast(ids_of.len), controller);
 
@@ -243,7 +243,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         try out.writeAll(usage);
         return;
     };
-    if (try options.complain(out, arm64.fdt.cpusThatFit(ram_base))) return;
+    if (try options.complain(out, arch.platform.cpusThatFit(ram_base))) return;
 
     // A harness starts a guest for every session, so where the time goes before the guest
     // runs matters as much as how fast the guest boots.
@@ -332,7 +332,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     for (ids) |*each| each.* = try hv.addVcpu();
     const id = ids[0];
 
-    var gic = try backend.kvm.Gic.create(&machine.vm, options.cpus, arm64.fdt.gicd_base, arm64.fdt.gicr_base);
+    var gic = try backend.platform.createController(&machine.vm, options.cpus);
     defer gic.deinit();
 
     var manifest: Manifest = .{};
@@ -449,7 +449,11 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     }
     try out.flush();
 
-    var serial: device.Pl011 = .{ .sink = out };
+    // The serial port. Where it sits and how the guest reaches it is the architecture's: a memory
+    // mapped PL011 on arm, an I/O port 16550 on x86. The run loop is given a port bus only when the
+    // serial is on one, because a bus with nothing on it still answers an access that matched nothing.
+    const Serial = if (arch.platform.serial_is_port) device.Uart16550 else device.Pl011;
+    var serial: Serial = .{ .sink = out };
 
     var block: device.virtio.Block = undefined;
     if (disk) |bytes| block.init(bytes);
@@ -566,23 +570,35 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     }
     defer if (chip_socket) |*open| open.close(io);
 
+    const platform = arch.platform;
     var attached: Attached = .{};
-    attached.add(serial.device(uart_base));
-    if (sharing) {
-        attached.addServed(shared_fs.device(arm64.fdt.fs_base), shared_fs.service(arm64.fdt.fs_intid));
+
+    // The serial port goes on whichever bus the architecture reaches it through. On x86 it is an I/O
+    // port with its own bus; on arm it is one more memory mapped device beside the rest.
+    var port_devices: [1]device.Bus.Device = undefined;
+    var port_bus: ?device.Bus = null;
+    if (arch.platform.serial_is_port) {
+        port_devices[0] = serial.device(platform.serial.addr);
+        port_bus = .{ .devices = &port_devices };
+    } else {
+        attached.add(serial.device(platform.serial.addr));
     }
-    if (options.tpm != null) attached.add(chip.device(arm64.fdt.tpm_base));
+
+    if (sharing) {
+        attached.addServed(shared_fs.device(platform.fs.addr), shared_fs.service(platform.fs.intid));
+    }
+    if (options.tpm != null) attached.add(chip.device(platform.tpm.addr));
     if (disk != null) {
-        attached.addServed(block.device(arm64.fdt.virtio_base), block.service(arm64.fdt.virtio_intid));
+        attached.addServed(block.device(platform.virtio.addr), block.service(platform.virtio.intid));
     }
     if (options.vsock != null) {
-        attached.addServed(channel.device(arm64.fdt.vsock_base), channel.service(arm64.fdt.vsock_intid));
+        attached.addServed(channel.device(platform.vsock.addr), channel.service(platform.vsock.intid));
     }
     if (options.limit != null) {
-        attached.addServed(balloon.device(arm64.fdt.balloon_base), balloon.service(arm64.fdt.balloon_intid));
+        attached.addServed(balloon.device(platform.balloon.addr), balloon.service(platform.balloon.intid));
     }
     if (options.net != null or options.nat) {
-        attached.addServed(card.device(arm64.fdt.net_base), card.service(arm64.fdt.net_intid));
+        attached.addServed(card.device(platform.net.addr), card.service(platform.net.intid));
     }
     var bus = attached.bus();
 
@@ -696,11 +712,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     const driving: core.Launch.Run = .{
         .bus = &bus,
         .memory = &memory,
-        .controller = gic.controller(),
+        .controller = backend.platform.controllerLine(&gic),
         .services = attached.served(),
         .exits = options.exits,
         .host = end.launchHost(),
         .guard = if (options.cpus > 1) shared.guard() else null,
+        .ports = if (port_bus) |*one| one else null,
     };
 
     // The other CPUs run on threads of their own. Each waits inside the hypervisor until the guest asks

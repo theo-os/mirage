@@ -55,10 +55,15 @@ pub fn build(b: *std.Build) void {
     const arm64 = add.lib("mirage-arm64", &.{
         .{ .name = "dtree", .module = dtree },
         .{ .name = "mirage-device", .module = device },
+        .{ .name = "mirage-memory", .module = memory },
+        .{ .name = "mirage-attest", .module = attest },
     });
     // The x86 arch module is built on every host so its tests run, even while a build
     // for another target does not select it.
-    const x86_64 = add.lib("mirage-x86_64", &.{.{ .name = "mirage-memory", .module = memory }});
+    const x86_64 = add.lib("mirage-x86_64", &.{
+        .{ .name = "mirage-memory", .module = memory },
+        .{ .name = "mirage-attest", .module = attest },
+    });
     // One architecture, chosen by the target, exposed under the one name the backend and
     // the core name. The concrete modules stay available where a file names an arch.
     const arch = switch (target.result.cpu.arch) {
@@ -207,6 +212,7 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "mirage-backend", .module = backend },
                     .{ .name = "mirage-core", .module = core },
                     .{ .name = "mirage-arm64", .module = arm64 },
+                    .{ .name = "mirage-arch", .module = arch },
                     .{ .name = "mirage-device", .module = device },
                     .{ .name = "mirage-image", .module = image },
                     .{ .name = "mirage-net", .module = net },
