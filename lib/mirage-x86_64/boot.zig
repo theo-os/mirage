@@ -43,6 +43,8 @@ pub const SetupHeader = extern struct {
 // before any image is ever parsed.
 comptime {
     const base = 0x1f1;
+    // Pin the size too, so a later field cannot grow the struct unnoticed.
+    std.debug.assert(@sizeOf(SetupHeader) == 0x264 - base);
     std.debug.assert(@offsetOf(SetupHeader, "setup_sects") == 0x1f1 - base);
     std.debug.assert(@offsetOf(SetupHeader, "boot_flag") == 0x1fe - base);
     std.debug.assert(@offsetOf(SetupHeader, "header") == 0x202 - base);
