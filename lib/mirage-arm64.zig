@@ -7,6 +7,9 @@
 pub const boot = @import("mirage-arm64/boot.zig");
 pub const esr = @import("mirage-arm64/esr.zig");
 pub const fdt = @import("mirage-arm64/fdt.zig");
+/// Where this architecture's devices sit and how many CPUs its memory holds. A runner names this
+/// rather than the device tree, so one runner serves both architectures.
+pub const platform = @import("mirage-arm64/platform.zig");
 pub const psci = @import("mirage-arm64/psci.zig");
 pub const timer = @import("mirage-arm64/timer.zig");
 pub const registers = @import("mirage-arm64/registers.zig");
@@ -23,6 +26,7 @@ test {
     _ = psci;
     _ = timer;
     _ = fdt;
+    _ = platform;
     _ = registers;
     _ = Register;
     _ = &enter;
