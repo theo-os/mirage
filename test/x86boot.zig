@@ -56,6 +56,7 @@ const net_intid = 19;
 
 /// The addresses the NAT invents for the guest and its gateway. The guest-init holds the guest side.
 const guest_mac = [6]u8{ 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
+const gateway_mac = [6]u8{ 0x52, 0x54, 0x00, 0x12, 0x34, 0x57 };
 
 /// The balloon device slot. The guest's balloon driver hands pages to the device to reach the target
 /// this gate sets; the gate takes those pages back. Pages handed over are proof a real driver drove it.
@@ -769,7 +770,7 @@ test "an x86 guest reaches a network through the vmm nat" {
         .guest_ip = .{ 10, 0, 2, 15 },
         .guest_mac = guest_mac,
         .gateway_ip = .{ 10, 0, 2, 2 },
-        .gateway_mac = .{ 0x52, 0x54, 0x00, 0x12, 0x34, 0x57 },
+        .gateway_mac = gateway_mac,
         .resolver = .{ 1, 1, 1, 1 },
     };
     defer nat.deinit();
@@ -808,9 +809,10 @@ test "an x86 guest reaches a network through the vmm nat" {
     var exits: usize = 0;
     var frames_out: usize = 0;
     var frames_in: usize = 0;
-    // Whether the guest ever sent an IPv4 frame. A guest only addresses the gateway in IP after it
-    // has the gateway's MAC, which it learns from the ARP reply the NAT sends. So an IPv4 frame out
-    // of the guest is proof the reply reached it, which it could only do over the interrupt line.
+    // Whether the guest ever sent an IPv4 frame addressed to the gateway's MAC. It only knows that
+    // MAC from the ARP reply the NAT sends, so such a frame is proof the reply reached it over the
+    // interrupt line. Requiring the gateway MAC (not a broadcast) rules out a broadcast IPv4 frame
+    // that would need no prior reply.
     var sent_ip = false;
     while (exits < max_exits) : (exits += 1) {
         if (exits % 1024 == 0 and nowMs() > deadline) {
@@ -837,7 +839,8 @@ test "an x86 guest reaches a network through the vmm nat" {
         var answer: [device.virtio.Net.max_frame]u8 = undefined;
         while (card.receive(&memory, &asked) catch null) |length| {
             frames_out += 1;
-            if (length >= 14 and asked[12] == 0x08 and asked[13] == 0x00) sent_ip = true;
+            if (length >= 14 and asked[12] == 0x08 and asked[13] == 0x00 and
+                std.mem.eql(u8, asked[0..6], &gateway_mac)) sent_ip = true;
             if (nat.fromGuest(asked[0..length], &answer)) |reply| {
                 if (card.send(&memory, reply) catch false) frames_in += 1;
             }
