@@ -14,6 +14,7 @@ const GuestMemory = @import("mirage-memory").GuestMemory;
 const attest = @import("mirage-attest");
 const Manifest = attest.Manifest;
 const image = @import("mirage-image");
+const netmod = @import("mirage-net");
 const linux = std.os.linux;
 
 /// The guest userspace, built for x86_64 by the same `zig build` as the VMM. Unpacked
@@ -46,6 +47,15 @@ const vsock_intid = 17;
 /// this line, so a root read only returns once the controller has delivered the interrupt.
 const block_addr = 0xd000_0000;
 const block_intid = 16;
+
+/// The net device slot. The guest brings up eth0 on it, ARPs the gateway, and sends a name query;
+/// the VMM's own NAT answers. The guest only sends the query after it hears the ARP reply, so a
+/// second frame out of the guest is proof the interrupt on this line reached it.
+const net_addr = 0xd000_0600;
+const net_intid = 19;
+
+/// The addresses the NAT invents for the guest and its gateway. The guest-init holds the guest side.
+const guest_mac = [6]u8{ 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
 
 /// The address the guest answers to, and the port both sides agreed on. The guest-init holds the
 /// same two numbers, and a channel where one side disagrees is a channel nobody answers.
@@ -706,4 +716,150 @@ test "an x86 guest boots from an erofs root over virtio-mmio" {
     // With no initramfs, reaching userspace is proof the guest read `/init` off the virtio-mmio block
     // device, so discovery, the block request queue, and the interrupt all work end to end.
     try std.testing.expect(booted);
+}
+
+test "an x86 guest reaches a network through the vmm nat" {
+    if (@import("builtin").cpu.arch != .x86_64) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+
+    const kernel = (try mapKernel()) orelse return error.SkipZigTest;
+    defer std.posix.munmap(kernel);
+
+    var machine = backend.kvm.Machine.create(gpa, 1) catch |err| switch (err) {
+        error.NoKvm => return error.SkipZigTest,
+        else => return err,
+    };
+    defer machine.deinit();
+
+    const region = try machine.vm.addMemory(ram_base, ram_size, .shared);
+    var regions = [_]GuestMemory.Region{region};
+    var memory: GuestMemory = .{ .regions = &regions };
+
+    const hv = machine.backend();
+    const id = try hv.addVcpu();
+
+    var controller = try backend.platform.createController(&machine.vm, 1);
+    defer controller.deinit();
+    const line = backend.platform.controllerLine(&controller);
+
+    var manifest: Manifest = .{};
+    defer manifest.deinit(gpa);
+
+    // The initramfs the guest runs from: its `/init` brings the network up and asks a name.
+    var archive: image.Cpio = .init(gpa);
+    defer archive.deinit();
+    try archive.addDirectory("dev", 0o755);
+    try archive.addCharacterDevice("dev/console", 0o600, 5, 1);
+    try archive.addFile("init", 0o755, guest_init);
+    const initrd = try archive.finish();
+    defer gpa.free(initrd);
+
+    var card: device.virtio.Net = undefined;
+    card.init(guest_mac);
+
+    // A network of this gate's own: the NAT invents a gateway and answers the guest's ARP and name
+    // queries. No external helper is needed; the resolver only matters once a name query is carried.
+    var nat: netmod.Nat = .{
+        .guest_ip = .{ 10, 0, 2, 15 },
+        .guest_mac = guest_mac,
+        .gateway_ip = .{ 10, 0, 2, 2 },
+        .gateway_mac = .{ 0x52, 0x54, 0x00, 0x12, 0x34, 0x57 },
+        .resolver = .{ 1, 1, 1, 1 },
+    };
+    defer nat.deinit();
+
+    const layout = try core.Launch.prepare(gpa, &memory, &manifest, .{
+        .kernel = kernel,
+        .initrd = initrd,
+        .cmdline = "console=ttyS0 earlyprintk=serial,ttyS0 panic=-1 rdinit=/init",
+        .ram_base = ram_base,
+        .ram_size = ram_size,
+        .cpus = 1,
+        .uart_base = serial_port,
+        // The one declared virtio device is the net card at platform.net (gsi 19).
+        .net = true,
+        .block_device = false,
+    });
+
+    const output = try gpa.alloc(u8, 256 << 10);
+    defer gpa.free(output);
+    var sink = std.Io.Writer.fixed(output);
+    var serial: device.Uart16550 = .{ .sink = &sink };
+    var acpi_shutdown: device.AcpiShutdown = .{ .slp_typ = acpi.s5_slp_typ };
+
+    var port_devices = [_]device.Bus.Device{ serial.device(serial_port), acpi_shutdown.device(acpi.sleep_port) };
+    var ports: device.Bus = .{ .devices = &port_devices };
+    var mmio_devices = [_]device.Bus.Device{card.device(net_addr)};
+    var bus: device.Bus = .{ .devices = &mmio_devices };
+
+    var services = [_]device.Service{ serial.service(serial_irq), card.service(net_intid) };
+
+    try arch.boot.enter(&machine.vcpus[id], layout);
+
+    const deadline = nowMs() + 20_000;
+    armTicks(10);
+
+    var exits: usize = 0;
+    var frames_out: usize = 0;
+    var frames_in: usize = 0;
+    // Whether the guest ever sent an IPv4 frame. A guest only addresses the gateway in IP after it
+    // has the gateway's MAC, which it learns from the ARP reply the NAT sends. So an IPv4 frame out
+    // of the guest is proof the reply reached it, which it could only do over the interrupt line.
+    var sent_ip = false;
+    while (exits < max_exits) : (exits += 1) {
+        if (exits % 1024 == 0 and nowMs() > deadline) {
+            std.debug.print("\n=== deadline after {d} exits ===\n", .{exits});
+            break;
+        }
+
+        const exit = hv.run(id) catch |err| {
+            std.debug.print("\nrun failed after {d} exits: {t}, kvm said {?}\n", .{ exits, err, machine.fault });
+            break;
+        };
+
+        switch (exit) {
+            .port_out => |w| ports.write(w.port, w.size, w.value),
+            .port_in => |r| try hv.completeMmioRead(id, ports.read(r.port, r.size)),
+            .mmio_write => |w| bus.write(w.gpa, w.size, w.value),
+            .mmio_read => |r| try hv.completeMmioRead(id, bus.read(r.gpa, r.size)),
+            .interrupted => {},
+            else => break,
+        }
+
+        // Move frames both ways each pass: what the guest sent, through the NAT, back to the guest.
+        var asked: [device.virtio.Net.max_frame]u8 = undefined;
+        var answer: [device.virtio.Net.max_frame]u8 = undefined;
+        while (card.receive(&memory, &asked) catch null) |length| {
+            frames_out += 1;
+            if (length >= 14 and asked[12] == 0x08 and asked[13] == 0x00) sent_ip = true;
+            if (nat.fromGuest(asked[0..length], &answer)) |reply| {
+                if (card.send(&memory, reply) catch false) frames_in += 1;
+            }
+        }
+        if (nat.poll(&answer)) |reply| {
+            if (card.send(&memory, reply) catch false) frames_in += 1;
+        }
+
+        try core.Launch.poll(services[0..services.len], &memory, line);
+
+        if (acpi_shutdown.requested) break;
+
+        if (sink.buffered().len + 512 > output.len) break;
+    }
+
+    if (frames_out == 0) {
+        std.debug.print(
+            "\nnote: the guest sent no network frames. This gate needs -Dkernel= a kernel with " ++
+                "virtio-mmio + virtio-net built in; skipping. See the B2b-2a memory.\n",
+            .{},
+        );
+        return error.SkipZigTest;
+    }
+
+    // The guest brought the card up and sent frames, the NAT answered, and the guest went on to send
+    // an IPv4 frame, which it only does after the ARP reply reached it over the interrupt line.
+    try std.testing.expect(frames_out >= 1);
+    try std.testing.expect(frames_in >= 1);
+    try std.testing.expect(sent_ip);
 }

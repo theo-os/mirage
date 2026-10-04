@@ -372,6 +372,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "mirage-memory", .module = memory },
                 .{ .name = "mirage-attest", .module = attest },
                 .{ .name = "mirage-image", .module = image },
+                .{ .name = "mirage-net", .module = net },
                 .{ .name = "boot-options", .module = boot_options.createModule() },
             },
         });
@@ -421,6 +422,17 @@ pub fn build(b: *std.Build) void {
         });
         b.step("test-x86block", "Boot a real x86 kernel from an erofs root over virtio-mmio under KVM")
             .dependOn(&b.addRunArtifact(x86block_tests).step);
+
+        // The x86 net gate: the guest brings up a virtio-mmio net card and exchanges frames with the
+        // VMM's own NAT. Needs `-Dkernel=` a kernel with virtio-mmio + virtio-net built in; skips
+        // otherwise. Its own step so `zig build test` does not need an x86 kernel.
+        const x86net_tests = b.addTest(.{
+            .name = "x86net",
+            .root_module = x86boot_module,
+            .filters = &.{"reaches a network"},
+        });
+        b.step("test-x86net", "Boot a real x86 kernel and exchange network frames through the vmm nat under KVM")
+            .dependOn(&b.addRunArtifact(x86net_tests).step);
 
         // Stops a guest, moves it to a machine that has never run, and lets it carry on. Its own
         // target because it needs a kernel and because what it proves is separate.
