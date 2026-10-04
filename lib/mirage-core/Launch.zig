@@ -84,6 +84,11 @@ pub const Run = struct {
     /// aarch64 never produces port exits, so leaving this null is correct there and on x86
     /// before a serial device is attached.
     ports: ?*device.Bus = null,
+    /// Set by a port device to signal a clean poweroff. The run loop checks this after
+    /// every port write and returns `Reason.shutdown` when it is true. Only x86 port
+    /// exits reach this path; aarch64 never produces port exits, so leaving this null
+    /// is correct there.
+    shutdown: ?*bool = null,
 };
 
 /// What a caller with more than one CPU hands over so they can share their devices.
@@ -215,6 +220,7 @@ pub fn run(hv: Backend, vcpu: Backend.VcpuId, options: Run) RunError!Reason {
                 defer release(options);
                 acting(options, vcpu);
                 ports.write(w.port, w.size, w.value);
+                if (options.shutdown) |flag| if (flag.*) return .shutdown;
             } else return Backend.Error.HypervisorFault,
             .port_in => |r| if (options.ports) |ports| {
                 take(options);

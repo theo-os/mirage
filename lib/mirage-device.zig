@@ -58,6 +58,7 @@ pub const Service = struct {
     pub const Error = virtio.Queue.Error;
 };
 
+pub const AcpiShutdown = @import("mirage-device/AcpiShutdown.zig");
 pub const Gicv2 = @import("mirage-device/Gicv2.zig");
 pub const Pl011 = @import("mirage-device/Pl011.zig");
 pub const Uart16550 = @import("mirage-device/Uart16550.zig");
@@ -74,6 +75,7 @@ pub const virtio = struct {
 
 test {
     _ = Bus;
+    _ = AcpiShutdown;
     _ = Gicv2;
     _ = Pl011;
     _ = Uart16550;
