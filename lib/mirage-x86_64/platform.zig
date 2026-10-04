@@ -37,11 +37,39 @@ pub const vsock: Device = .{ .addr = virtio_window + 1 * virtio_stride, .intid =
 pub const balloon: Device = .{ .addr = virtio_window + 2 * virtio_stride, .intid = gsi_base + 2 };
 pub const net: Device = .{ .addr = virtio_window + 3 * virtio_stride, .intid = gsi_base + 3 };
 pub const fs: Device = .{ .addr = virtio_window + 4 * virtio_stride, .intid = gsi_base + 4 };
-pub const tpm: Device = .{ .addr = virtio_window + 5 * virtio_stride, .intid = gsi_base + 5 };
+// 0xfed4_0000 is the x86 TCG TIS base; the TIS region spans 0x5000 bytes (5 localities),
+// sitting in high MMIO clear of the virtio window and below the IOAPIC at 0xfec0_0000.
+pub const tpm: Device = .{ .addr = 0xfed4_0000, .intid = 0 };
 
 /// Whether the guest's serial port is reached through an I/O port rather than memory. x86 puts
 /// it on a port, so the run loop gives the serial a port bus rather than the memory one.
 pub const serial_is_port = true;
+
+const testing = @import("mirage-testing");
+const std = @import("std");
+
+test "the x86 tpm sits at the tis base" {
+    try testing.expectEqual(@as(u64, 0xfed4_0000), tpm.addr);
+
+    // TIS region: [tpm.addr, tpm.addr + 0x5000)
+    const tis_lo = tpm.addr;
+    const tis_hi = tpm.addr + 0x5000;
+
+    // Virtio window: [0xd000_0000, 0xd000_0000 + 6*0x200)
+    const virt_lo: u64 = 0xd000_0000;
+    const virt_hi: u64 = 0xd000_0000 + 6 * virtio_stride;
+    try std.testing.expect(tis_hi <= virt_lo or tis_lo >= virt_hi);
+
+    // IOAPIC: [0xfec0_0000, 0xfec0_0000 + 0x1000)
+    const ioapic_lo: u64 = 0xfec0_0000;
+    const ioapic_hi: u64 = 0xfec0_0000 + 0x1000;
+    try std.testing.expect(tis_hi <= ioapic_lo or tis_lo >= ioapic_hi);
+
+    // LAPIC: [0xfee0_0000, 0xfee0_0000 + 0x1000)
+    const lapic_lo: u64 = 0xfee0_0000;
+    const lapic_hi: u64 = 0xfee0_0000 + 0x1000;
+    try std.testing.expect(tis_hi <= lapic_lo or tis_lo >= lapic_hi);
+}
 
 /// How many CPUs a guest may have. The interrupt controller the hypervisor builds holds far more
 /// than any guest this runner starts, so the bound is a plain ceiling rather than one worked out
