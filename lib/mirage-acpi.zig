@@ -156,6 +156,136 @@ fn writeGas(dst: []u8, off: usize, port: u16) void {
     std.mem.writeInt(u64, dst[off + 4 ..][0..8], port, .little);
 }
 
+/// A virtio-mmio device to encode as an ACPI Device object in the DSDT.
+pub const VirtioDevice = struct {
+    addr: u64,
+    size: u32,
+    gsi: u32,
+};
+
+// Fixed body lengths used in emitDevice. Comptime asserts pin them.
+const mem32_body_len: usize = 9; // info(1) + base(4) + length(4)
+const extirq_body_len: usize = 6; // flags(1) + count(1) + gsi(4)
+const crs_resources_len: usize = 12 + 9 + 2; // Memory32Fixed + ExtInterrupt + EndTag
+
+comptime {
+    std.debug.assert(mem32_body_len == 9);
+    std.debug.assert(extirq_body_len == 6);
+    std.debug.assert(crs_resources_len == 23);
+}
+
+/// Write an ACPI PkgLength for a package whose content (not counting the
+/// PkgLength bytes) is `content_len` bytes. Returns the number of bytes
+/// written: 1 when total < 0x40, 2 otherwise.
+fn writePkgLength(buf: []u8, content_len: usize) usize {
+    const total1 = content_len + 1;
+    if (total1 < 0x40) {
+        buf[0] = @intCast(total1);
+        return 1;
+    }
+    const total2 = content_len + 2;
+    std.debug.assert(total2 < 0x1000);
+    buf[0] = @intCast(0x40 | (total2 & 0x0F));
+    buf[1] = @intCast(total2 >> 4);
+    return 2;
+}
+
+/// Write one Device(VRnn){ _HID "LNRO0005"; _UID index; _CRS ... } into buf.
+/// Returns bytes written.
+fn emitDevice(buf: []u8, index: u8, dev: VirtioDevice) usize {
+    std.debug.assert(index < 100);
+    std.debug.assert(dev.addr <= 0xFFFF_FFFF);
+
+    // Resource descriptors (23 bytes total).
+    var resources: [crs_resources_len]u8 = undefined;
+    // Memory32Fixed: tag 0x86, body-length u16 LE = 9, then info + base + length.
+    resources[0] = 0x86;
+    resources[1] = mem32_body_len;
+    resources[2] = 0x00;
+    resources[3] = 0x01; // ReadWrite
+    std.mem.writeInt(u32, resources[4..8], @intCast(dev.addr), .little);
+    std.mem.writeInt(u32, resources[8..12], dev.size, .little);
+    // Extended Interrupt: tag 0x89, body-length u16 LE = 6, flags, count, gsi.
+    resources[12] = 0x89;
+    resources[13] = extirq_body_len;
+    resources[14] = 0x00;
+    resources[15] = 0x01; // Consumer, Level, ActiveHigh, Exclusive
+    resources[16] = 0x01; // interrupt count = 1
+    std.mem.writeInt(u32, resources[17..21], dev.gsi, .little);
+    // EndTag.
+    resources[21] = 0x79;
+    resources[22] = 0x00;
+
+    // _CRS Name object: NameOp + "_CRS" + BufferOp + PkgLength + BufferSize + resources.
+    // BufferOp PkgLength content = BufferSize(2) + resources(23) = 25; total = 26 = 0x1A.
+    var crs: [32]u8 = undefined;
+    var cp: usize = 0;
+    crs[cp] = 0x08; cp += 1; // NameOp
+    crs[cp] = 0x5F; crs[cp + 1] = 0x43; crs[cp + 2] = 0x52; crs[cp + 3] = 0x53; cp += 4; // _CRS
+    crs[cp] = 0x11; cp += 1; // BufferOp
+    cp += writePkgLength(crs[cp..], 2 + crs_resources_len); // BufferSize(2) + resources(23)
+    crs[cp] = almanac.aml.encoding.byte_prefix; cp += 1;
+    crs[cp] = crs_resources_len; cp += 1; // 0x17 = 23
+    @memcpy(crs[cp .. cp + crs_resources_len], &resources);
+    cp += crs_resources_len;
+    const crs_len = cp;
+
+    // Name(_HID,"LNRO0005"): 08 + _HID + 0D + "LNRO0005" + 00 = 15 bytes.
+    const hid = [15]u8{
+        0x08, // NameOp
+        0x5F, 0x48, 0x49, 0x44, // _HID
+        0x0D, // StringPrefix
+        'L', 'N', 'R', 'O', '0', '0', '0', '5',
+        0x00, // NUL
+    };
+
+    // Name(_UID,n): 08 + _UID + BytePrefix + n = 7 bytes.
+    const uid = [7]u8{
+        0x08, // NameOp
+        0x5F, 0x55, 0x49, 0x44, // _UID
+        almanac.aml.encoding.byte_prefix,
+        index,
+    };
+
+    // Device = 5B 82 + PkgLength(NameSeg(4) + body) + NameSeg + body.
+    const body_len = hid.len + uid.len + crs_len;
+    const pkg_content = 4 + body_len; // NameSeg(4) + body
+
+    var p: usize = 0;
+    buf[p] = 0x5B; p += 1; // ExtOpPrefix
+    buf[p] = 0x82; p += 1; // DeviceOp
+    p += writePkgLength(buf[p..], pkg_content);
+    buf[p] = 'V'; p += 1;
+    buf[p] = 'R'; p += 1;
+    buf[p] = '0' + (index / 10); p += 1;
+    buf[p] = '0' + (index % 10); p += 1;
+    @memcpy(buf[p .. p + hid.len], &hid); p += hid.len;
+    @memcpy(buf[p .. p + uid.len], &uid); p += uid.len;
+    @memcpy(buf[p .. p + crs_len], crs[0..crs_len]); p += crs_len;
+    return p;
+}
+
+/// Write Scope(\_SB_){ <one Device per dev> } into buf. Returns bytes written.
+pub fn emitSystemBus(buf: []u8, devs: []const VirtioDevice) usize {
+    // Encode all devices into a scratch area first to know total length.
+    var scratch: [4096]u8 = undefined;
+    var dev_total: usize = 0;
+    for (devs, 0..) |dev, i| {
+        dev_total += emitDevice(scratch[dev_total..], @intCast(i), dev);
+    }
+
+    // Scope(\_SB_): 10 + PkgLength(over \_SB_ name(5) + devices) + \_SB_(5) + devices
+    const scope_content = 5 + dev_total; // \_SB_(5) + devices
+    var p: usize = 0;
+    buf[p] = 0x10; p += 1; // ScopeOp
+    p += writePkgLength(buf[p..], scope_content);
+    // \_SB_ = root_char + "_SB_" = 5C 5F 53 42 5F
+    buf[p] = 0x5C; p += 1; // root_char '\'
+    buf[p] = 0x5F; buf[p+1] = 0x53; buf[p+2] = 0x42; buf[p+3] = 0x5F; p += 4; // _SB_
+    @memcpy(buf[p..p+dev_total], scratch[0..dev_total]); p += dev_total;
+    return p;
+}
+
 /// Build an RSDP, XSDT, hardware-reduced FADT, and DSDT carrying _S5 into
 /// `buf` at guest physical address `base_phys`. Returns the bytes written and
 /// the RSDP's physical address as the Builder placed it.
@@ -316,6 +446,91 @@ test "the dsdt carries an s5 package the fadt points at" {
     try std.testing.expect(aml_body[9] == s5_slp_typ); // SLP_TYPa = 5
     try std.testing.expect(aml_body[10] == almanac.aml.encoding.byte_prefix); // SLP_TYPb prefix
     try std.testing.expect(aml_body[11] == s5_slp_typ); // SLP_TYPb = 5
+}
+
+test "an aml device object decodes back to its resources" {
+    const dev = VirtioDevice{ .addr = 0xd0000200, .size = 0x200, .gsi = 17 };
+    var buf: [256]u8 = undefined;
+    const len = emitSystemBus(&buf, &.{dev});
+
+    // Scan the emitted bytes for the Device opcode (5B 82) to locate VR00.
+    const aml = buf[0..len];
+    var device_off: ?usize = null;
+    var i: usize = 0;
+    while (i + 1 < aml.len) : (i += 1) {
+        if (aml[i] == 0x5B and aml[i + 1] == 0x82) {
+            device_off = i;
+            break;
+        }
+    }
+    try std.testing.expect(device_off != null);
+
+    // After 5B 82 + PkgLength(1 byte for <0x40) comes the NameSeg "VR00".
+    const dev_start = device_off.?;
+    const pkg = try almanac.aml.encoding.pkgLength(aml[dev_start + 2 ..]);
+    const nameseg_off = dev_start + 2 + pkg.byte_count;
+    try std.testing.expect(std.mem.eql(u8, aml[nameseg_off .. nameseg_off + 4], "VR00"));
+
+    // Walk the Device body to find _HID and _UID values.
+    const body_start = nameseg_off + 4;
+    const device_end = dev_start + 2 + pkg.value;
+
+    var body_pos = body_start;
+    var found_hid = false;
+    var found_uid = false;
+    var crs_resource_bytes: []const u8 = &.{};
+
+    while (body_pos < device_end) {
+        if (aml[body_pos] != 0x08) break; // only Name() objects expected here
+        const name_bytes = aml[body_pos + 1 ..];
+        const ns = try almanac.aml.encoding.nameString(name_bytes);
+        const value_off = body_pos + 1 + ns.byte_count;
+
+        if (ns.segments.len == 1 and std.mem.eql(u8, &ns.segments[0], "_HID")) {
+            // StringPrefix (0D) + "LNRO0005" + NUL
+            try std.testing.expect(aml[value_off] == 0x0D);
+            const str_end = std.mem.indexOfScalarPos(u8, aml, value_off + 1, 0).?;
+            try std.testing.expect(std.mem.eql(u8, aml[value_off + 1 .. str_end], "LNRO0005"));
+            found_hid = true;
+            body_pos = str_end + 1;
+        } else if (ns.segments.len == 1 and std.mem.eql(u8, &ns.segments[0], "_UID")) {
+            // BytePrefix + n
+            try std.testing.expect(aml[value_off] == almanac.aml.encoding.byte_prefix);
+            try testing.expectEqual(@as(u8, 0), aml[value_off + 1]);
+            found_uid = true;
+            body_pos = value_off + 2;
+        } else if (ns.segments.len == 1 and std.mem.eql(u8, &ns.segments[0], "_CRS")) {
+            // BufferOp(0x11) + PkgLength + BufferSize + resource bytes.
+            const buf_op_off = value_off;
+            try std.testing.expect(aml[buf_op_off] == 0x11);
+            const buf_pkg = try almanac.aml.encoding.pkgLength(aml[buf_op_off + 1 ..]);
+            // Skip BufferOp(1) + PkgLength + BufferSize(BytePrefix + byte = 2).
+            const res_off = buf_op_off + 1 + buf_pkg.byte_count + 2;
+            const crs_end = buf_op_off + 1 + buf_pkg.value;
+            crs_resource_bytes = aml[res_off..crs_end];
+            body_pos = crs_end;
+        } else {
+            break;
+        }
+    }
+
+    try std.testing.expect(found_hid);
+    try std.testing.expect(found_uid);
+    try std.testing.expect(crs_resource_bytes.len > 0);
+
+    // Decode the _CRS resources with almanac's resource.Iterator.
+    var res_it = almanac.resource.iterate(crs_resource_bytes);
+    const r0 = (try res_it.next()).?;
+    try std.testing.expect(r0 == .fixed_memory32);
+    try testing.expectEqual(@as(u32, 0xd0000200), r0.fixed_memory32.base);
+    try testing.expectEqual(@as(u32, 0x200), r0.fixed_memory32.length);
+
+    const r1 = (try res_it.next()).?;
+    try std.testing.expect(r1 == .extended_irq);
+    try testing.expectEqual(@as(usize, 1), r1.extended_irq.interrupts.len);
+    try testing.expectEqual(@as(u32, 17), r1.extended_irq.interrupts[0]);
+
+    try std.testing.expect((try res_it.next()) == null); // EndTag terminates
 }
 
 test {
