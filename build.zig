@@ -367,6 +367,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "mirage-core", .module = core },
                 .{ .name = "mirage-backend", .module = backend },
                 .{ .name = "mirage-device", .module = device },
+                .{ .name = "mirage-acpi", .module = acpi },
                 .{ .name = "mirage-arch", .module = arch },
                 .{ .name = "mirage-memory", .module = memory },
                 .{ .name = "mirage-attest", .module = attest },

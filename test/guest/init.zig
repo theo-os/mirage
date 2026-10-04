@@ -2,8 +2,8 @@
 //!
 //! It proves the guest reached userspace, then opens the channel back to whoever
 //! started it, says something and reads the answer. Last it asks the kernel to stop.
-//! On aarch64 that becomes a PSCI system_off call. On x86_64 that becomes a reset.
-//! Either way the VMM sees a clean exit.
+//! That becomes a power off: a PSCI system_off call on aarch64, an ACPI `_S5` write
+//! on x86_64. Either way the VMM sees a clean exit.
 //!
 //! No libc and no allocator. The guest opens the console itself and keeps the file
 //! descriptor so its output is not lost. If opening fails it falls back to descriptor one.
@@ -980,17 +980,9 @@ pub fn main() void {
     var pause: linux.timespec = .{ .sec = 0, .nsec = 300 * std.time.ns_per_ms };
     while (linux.nanosleep(&pause, &pause) == @as(usize, @bitCast(@as(isize, -4)))) {}
 
-    // x86 has no pm_power_off without ACPI; a reset via triple fault is the clean stop KVM sees.
-    _ = linux.reboot(
-        .MAGIC1,
-        .MAGIC2,
-        switch (@import("builtin").cpu.arch) {
-            .aarch64 => .POWER_OFF,
-            else => .RESTART,
-        },
-        null,
-    );
+    // The clean stop is a power off: PSCI system_off on aarch64, ACPI `_S5` on x86.
+    _ = linux.reboot(.MAGIC1, .MAGIC2, .POWER_OFF, null);
 
-    // The kernel does not return from a power off or reset it accepted.
+    // The kernel does not return from a power off it accepted.
     while (true) {}
 }

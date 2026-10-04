@@ -8,6 +8,7 @@ const std = @import("std");
 const core = @import("mirage-core");
 const backend = @import("mirage-backend");
 const device = @import("mirage-device");
+const acpi = @import("mirage-acpi");
 const arch = @import("mirage-arch");
 const GuestMemory = @import("mirage-memory").GuestMemory;
 const attest = @import("mirage-attest");
@@ -267,7 +268,12 @@ test "a real x86 kernel boots to a guest in userspace and stops cleanly" {
     var sink = std.Io.Writer.fixed(output);
     var serial: device.Uart16550 = .{ .sink = &sink };
 
-    var port_devices = [_]device.Bus.Device{serial.device(serial_port)};
+    // The guest powers off through ACPI `_S5`: the kernel writes the sleep value to the FADT
+    // sleep-control port, which this device decodes. When it sets `requested` the machine has
+    // powered off of its own accord.
+    var acpi_shutdown: device.AcpiShutdown = .{ .slp_typ = acpi.s5_slp_typ };
+
+    var port_devices = [_]device.Bus.Device{ serial.device(serial_port), acpi_shutdown.device(acpi.sleep_port) };
     var ports: device.Bus = .{ .devices = &port_devices };
     var devices: [0]device.Bus.Device = undefined;
     var bus: device.Bus = .{ .devices = &devices };
@@ -281,9 +287,11 @@ test "a real x86 kernel boots to a guest in userspace and stops cleanly" {
 
     var exits: usize = 0;
     var stopped: ?backend.Backend.Exit = null;
+    var powered_off = false;
     while (exits < max_exits) : (exits += 1) {
-        // The guest asks the kernel to reset once it is done, which the kernel turns into a stop
-        // this loop sees below. The deadline is only a backstop for a guest that never gets there.
+        // The guest powers off through ACPI once it is done, which the kernel turns into a write
+        // to the sleep-control port this loop sees below. The deadline is only a backstop for a
+        // guest that never gets there.
         if (exits % 1024 == 0 and nowMs() > deadline) {
             std.debug.print("\n=== deadline after {d} exits ===\n", .{exits});
             break;
@@ -312,29 +320,33 @@ test "a real x86 kernel boots to a guest in userspace and stops cleanly" {
             },
         }
 
+        // The ACPI poweroff is a port write, not a vCPU exit the loop breaks on. Once the device
+        // has decoded the `_S5` sleep value the guest has stopped of its own accord.
+        if (acpi_shutdown.requested) {
+            powered_off = true;
+            break;
+        }
+
         if (sink.buffered().len + 512 > output.len) break;
     }
 
     const log = sink.buffered();
 
-    if (std.mem.indexOf(u8, log, alive) == null or stopped == null) {
-        // Where the guest got to, for a run that reached neither userspace nor a clean stop. The rip
-        // needs the concrete vCPU, the same one the boot entry took.
+    if (std.mem.indexOf(u8, log, alive) == null or !powered_off) {
+        // Where the guest got to, for a run that reached neither userspace nor the ACPI poweroff.
+        // The rip needs the concrete vCPU, the same one the boot entry took.
         const rip = machine.vcpus[id].getRegister(.rip) catch 0;
         std.debug.print(
-            "\n=== after {d} exits, stopped {?}, rip {x}, unmapped {d} ===\n{s}\n=== end ===\n",
-            .{ exits, stopped, rip, bus.unmapped, log },
+            "\n=== after {d} exits, stopped {?}, powered_off {}, rip {x}, unmapped {d} ===\n{s}\n=== end ===\n",
+            .{ exits, stopped, powered_off, rip, bus.unmapped, log },
         );
     }
 
     // The guest reached userspace: the kernel unpacked the archive, found `/init`, and ran it.
     try std.testing.expect(std.mem.indexOf(u8, log, alive) != null);
 
-    // And it stopped of its own accord rather than running out of time. The guest asked the kernel
-    // to reset, which with nothing else to reboot through becomes the stop KVM reports.
-    try std.testing.expect(stopped != null);
-    switch (stopped.?) {
-        .shutdown, .reset => {},
-        else => return error.TestUnexpectedResult,
-    }
+    // And it powered off through ACPI `_S5`: the kernel parsed our tables, registered the
+    // sleep-control port as its power-off handler, and wrote the S5 value there. Not a reset
+    // exit, not the deadline.
+    try std.testing.expect(powered_off);
 }
