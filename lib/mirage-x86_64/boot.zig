@@ -212,6 +212,8 @@ pub fn buildBootParams(
     cmdline: []const u8,
     initrd: ?[]const u8,
     low: LowLayout,
+    cpus: u32,
+    virtio: []const acpi.VirtioDevice,
 ) Error!void {
     // Reject a cmdline that would not fit in its reserved region.
     const cmdline_room = low.pml4 - low.cmdline;
@@ -230,7 +232,8 @@ pub fn buildBootParams(
     // the kernel finds it without scanning for the "RSD PTR " signature.
     {
         var acpi_buf: [4096]u8 align(16) = undefined;
-        const built = try acpi.build(&acpi_buf, acpi_base, .{});
+        const built = try acpi.build(&acpi_buf, acpi_base, .{ .cpus = cpus, .virtio = virtio });
+        std.debug.assert(acpi_base + built.bytes.len <= 0x9fc00);
         try memory.write(acpi_base, built.bytes);
         var rsdp_buf: [8]u8 = undefined;
         std.mem.writeInt(u64, &rsdp_buf, built.rsdp, .little);
@@ -322,7 +325,7 @@ test "boot_params carries the e820 map, cmdline pointer, and header" {
     header.version = 0x020c;
     // boot_flag at rel offset 0x0d (abs 0x1fe): set it so the copy preserves it
     header.boot_flag = 0xaa55;
-    try buildBootParams(&memory, header, "console=ttyS0", null, default_low);
+    try buildBootParams(&memory, header, "console=ttyS0", null, default_low, 1, &.{});
 
     // The copied header carries boot_flag 0xaa55 at zero-page offset 0x1fe.
     var flag_buf: [2]u8 = undefined;
@@ -359,7 +362,7 @@ test "a cmdline longer than its region is refused" {
     const too_long = try testing.allocator().alloc(u8, 0x10000);
     defer testing.allocator().free(too_long);
     @memset(too_long, 'x');
-    try testing.expectError(error.CmdlineTooLong, buildBootParams(&memory, header, too_long, null, default_low));
+    try testing.expectError(error.CmdlineTooLong, buildBootParams(&memory, header, too_long, null, default_low, 1, &.{}));
 }
 
 test "more than 128 regions is refused" {
@@ -374,7 +377,7 @@ test "more than 128 regions is refused" {
     var header: SetupHeader = std.mem.zeroes(SetupHeader);
     header.version = 0x020c;
 
-    try testing.expectError(error.TooManyRegions, buildBootParams(&memory, header, "x", null, default_low));
+    try testing.expectError(error.TooManyRegions, buildBootParams(&memory, header, "x", null, default_low, 1, &.{}));
 }
 
 test "an initramfs is placed in guest ram and recorded in boot_params" {
@@ -386,7 +389,7 @@ test "an initramfs is placed in guest ram and recorded in boot_params" {
     var header: SetupHeader = std.mem.zeroes(SetupHeader);
     header.version = 0x020c;
     const initrd = "INITRAMFSBYTES";
-    try buildBootParams(&memory, header, "console=ttyS0", initrd, default_low);
+    try buildBootParams(&memory, header, "console=ttyS0", initrd, default_low, 1, &.{});
     // ramdisk_image/ramdisk_size recorded
     var img: [4]u8 = undefined;
     try memory.read(default_low.boot_params + 0x218, &img);
@@ -410,7 +413,7 @@ test "an initramfs past guest ram is refused" {
     var header: SetupHeader = std.mem.zeroes(SetupHeader);
     header.version = 0x020c;
     const initrd = "INITRAMFSBYTES";
-    try testing.expectError(error.InitrdTooLarge, buildBootParams(&memory, header, "console=ttyS0", initrd, default_low));
+    try testing.expectError(error.InitrdTooLarge, buildBootParams(&memory, header, "console=ttyS0", initrd, default_low, 1, &.{}));
 }
 
 /// GDT selectors matching the descriptors written by buildLongMode.
@@ -571,6 +574,7 @@ pub const Config = struct {
     ram_size: u64,
     cpus: u32,
     uart_base: u64,
+    virtio: []const acpi.VirtioDevice = &.{},
 };
 
 pub const Layout = struct {
@@ -619,7 +623,7 @@ pub fn prepare(
         initrd_range = .{ .start = initrd_base, .end = initrd_base + bytes.len };
     }
 
-    try buildBootParams(memory, parsed.header, config.cmdline, config.initrd, low);
+    try buildBootParams(memory, parsed.header, config.cmdline, config.initrd, low, config.cpus, config.virtio);
     try buildLongMode(memory, low, config.ram_size);
     try memory.write(kernel_base, protected);
 
@@ -690,7 +694,7 @@ test "boot_params records the acpi rsdp address" {
     var memory: GuestMemory = .{ .regions = &regions };
     var header: SetupHeader = std.mem.zeroes(SetupHeader);
     header.version = 0x020c;
-    try buildBootParams(&memory, header, "console=ttyS0", null, default_low);
+    try buildBootParams(&memory, header, "console=ttyS0", null, default_low, 1, &.{});
 
     // Read the 8-byte acpi_rsdp_addr at zero-page offset 0x070.
     var rsdp_buf: [8]u8 = undefined;
@@ -702,4 +706,61 @@ test "boot_params records the acpi rsdp address" {
     var expect_buf: [4096]u8 align(16) = undefined;
     const built = try acpi.build(&expect_buf, acpi_base, .{});
     try testing.expectEqual(built.rsdp, recorded);
+}
+
+test "boot params build a dsdt with the given virtio device" {
+    const gpa = testing.allocator();
+    const backing = try gpa.alloc(u8, 0x200000);
+    defer gpa.free(backing);
+    @memset(backing, 0);
+    var regions = [_]GuestMemory.Region{.{ .gpa = 0, .len = 0x200000, .backing = .{ .shared = backing } }};
+    var memory: GuestMemory = .{ .regions = &regions };
+    var header: SetupHeader = std.mem.zeroes(SetupHeader);
+    header.version = 0x020c;
+
+    // Build with no devices; record the DSDT body length.
+    try buildBootParams(&memory, header, "console=ttyS0", null, default_low, 1, &.{});
+    var rsdp_buf: [8]u8 = undefined;
+    try memory.read(default_low.boot_params + acpi_rsdp_addr_offset, &rsdp_buf);
+    const rsdp_empty = std.mem.readInt(u64, &rsdp_buf, .little);
+    const offset: u64 = @intFromPtr(backing.ptr) -% @as(u64, 0);
+    const Tables = @import("almanac").TablesGeneric(@import("almanac").OffsetMapper);
+    const tabs_empty = try Tables.init(.{ .offset = offset }, rsdp_empty);
+    const fadt_empty = (try tabs_empty.findAs(@import("almanac").Fadt)).?;
+    const dsdt_addr_empty = fadt_empty.preferredDsdt();
+    const dsdt_hdr_empty = (@import("almanac").OffsetMapper{ .offset = offset }).slice(dsdt_addr_empty, 8);
+    const dsdt_len_empty = std.mem.readInt(u32, dsdt_hdr_empty[4..8], .little);
+
+    // Build with one virtio device; the DSDT must be longer.
+    @memset(backing, 0);
+    const dev = acpi.VirtioDevice{ .addr = 0xd0000200, .size = 0x200, .gsi = 17 };
+    try buildBootParams(&memory, header, "console=ttyS0", null, default_low, 1, &.{dev});
+    try memory.read(default_low.boot_params + acpi_rsdp_addr_offset, &rsdp_buf);
+    const rsdp_dev = std.mem.readInt(u64, &rsdp_buf, .little);
+    const tabs_dev = try Tables.init(.{ .offset = offset }, rsdp_dev);
+    const fadt_dev = (try tabs_dev.findAs(@import("almanac").Fadt)).?;
+    const dsdt_addr_dev = fadt_dev.preferredDsdt();
+    try std.testing.expect(dsdt_addr_dev != 0);
+
+    // Read full DSDT and locate the VR00 device object.
+    const dsdt_hdr_dev = (@import("almanac").OffsetMapper{ .offset = offset }).slice(dsdt_addr_dev, 8);
+    const dsdt_len_dev = std.mem.readInt(u32, dsdt_hdr_dev[4..8], .little);
+    try std.testing.expect(dsdt_len_dev > dsdt_len_empty);
+
+    const dsdt_bytes = (@import("almanac").OffsetMapper{ .offset = offset }).slice(dsdt_addr_dev, dsdt_len_dev);
+    const aml_body = dsdt_bytes[36..];
+    var device_off: ?usize = null;
+    var i: usize = 0;
+    while (i + 1 < aml_body.len) : (i += 1) {
+        if (aml_body[i] == 0x5B and aml_body[i + 1] == 0x82) {
+            device_off = i;
+            break;
+        }
+    }
+    try std.testing.expect(device_off != null);
+    const dev_start = device_off.?;
+    const almanac_mod = @import("almanac");
+    const pkg = try almanac_mod.aml.encoding.pkgLength(aml_body[dev_start + 2 ..]);
+    const nameseg_off = dev_start + 2 + pkg.byte_count;
+    try std.testing.expect(std.mem.eql(u8, aml_body[nameseg_off .. nameseg_off + 4], "VR00"));
 }
