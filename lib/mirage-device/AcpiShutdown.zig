@@ -36,7 +36,9 @@ fn write(ctx: *anyopaque, _: u64, _: Bus.Size, value: u64) void {
     // hw-reduced sleep-control: bits 2-4 = SLP_TYP, bit 5 = SLP_EN.
     const slp_en: u8 = 1 << 5;
     const expected: u8 = (@as(u8, self.slp_typ) << 2) | slp_en;
-    self.requested = (@as(u8, @truncate(value)) == expected);
+    // A request is sticky: once the guest has asked to power off, a later write
+    // of another value does not take the request back.
+    self.requested = self.requested or (@as(u8, @truncate(value)) == expected);
 }
 
 test "a write of the s5 sleep value to the acpi port requests shutdown" {
@@ -51,4 +53,15 @@ test "a write of the s5 sleep value to the acpi port requests shutdown" {
     dev.requested = false;
     ports.write(acpi_sleep_port, .byte, 0x00);
     try std.testing.expect(!dev.requested);
+}
+
+test "an acpi shutdown request stays set through a later non-matching write" {
+    const acpi_sleep_port: u64 = 0x600;
+    var dev: AcpiShutdown = .{ .slp_typ = 5 };
+    var devices = [_]Bus.Device{dev.device(acpi_sleep_port)};
+    var ports: Bus = .{ .devices = &devices };
+    ports.write(acpi_sleep_port, .byte, (5 << 2) | (1 << 5)); // requests shutdown
+    try std.testing.expect(dev.requested);
+    ports.write(acpi_sleep_port, .byte, 0x00); // a later write does not take it back
+    try std.testing.expect(dev.requested);
 }

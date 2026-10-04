@@ -85,9 +85,9 @@ pub const Run = struct {
     /// before a serial device is attached.
     ports: ?*device.Bus = null,
     /// Set by a port device to signal a clean poweroff. The run loop checks this after
-    /// every port write and returns `Reason.shutdown` when it is true. Only x86 port
-    /// exits reach this path; aarch64 never produces port exits, so leaving this null
-    /// is correct there.
+    /// every port write and returns `Reason.shutdown` when it is true. It is consulted
+    /// only on the port_out path, so it is meaningful only when `ports` is also set;
+    /// aarch64 never produces port exits, so leaving this null is correct there.
     shutdown: ?*bool = null,
 };
 
