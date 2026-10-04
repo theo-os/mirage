@@ -11,11 +11,13 @@ pub const almanac = @import("almanac");
 /// The I/O port the FADT sleep-control and sleep-status registers name.
 pub const sleep_port: u16 = 0x600;
 
-/// Options for building the ACPI table set. Carries optional table addresses
-/// for tables added in later tasks.
+/// The S5 sleep type value written to the hw-reduced sleep-control register
+/// to trigger poweroff. Task 5's shutdown-port device decodes
+/// (s5_slp_typ << 2) | (1 << 5) on that register.
+pub const s5_slp_typ: u8 = 5;
+
+/// Options for building the ACPI table set.
 pub const Options = struct {
-    /// Physical address of the DSDT; zero until Task 4 supplies one.
-    dsdt_phys: u64 = 0,
     /// How many Processor Local APIC entries the MADT carries.
     cpus: u32 = 1,
 };
@@ -31,6 +33,32 @@ pub const Built = struct {
 // The FADT is 276 bytes (ACPI 6.x). Layout is fixed by the spec; fields are
 // written by offset using std.mem.writeInt. Asserts below pin every field used.
 const fadt_size: usize = 276;
+
+// AML encoding for: Name (_S5, Package (2) { 5, 5 })
+//
+// ACPI spec §20.2.3: NameOp NameString; §20.2.5.4: PackageOp PkgLength
+// NumElements PackageElementList.
+//
+// PkgLength counts itself plus the body that follows it:
+//   body = NumElements(1 byte) + ByteData(2 bytes) + ByteData(2 bytes) = 5 bytes
+//   PkgLength = 1 (self) + 5 (body) = 6
+//
+// The two Byte() elements encode s5_slp_typ for SLP_TYPa and SLP_TYPb.
+const s5_aml = [_]u8{
+    0x08, // NameOp
+    0x5F, 0x53, 0x35, 0x5F, // "_S5_" NameSeg
+    0x12, // PackageOp
+    0x06, // PkgLength = 6 (self + 5 body bytes)
+    0x02, // NumElements = 2
+    almanac.aml.encoding.byte_prefix, s5_slp_typ, // SLP_TYPa = 5
+    almanac.aml.encoding.byte_prefix, s5_slp_typ, // SLP_TYPb = 5
+};
+
+comptime {
+    // PkgLength body: NumElements(1) + 2*ByteData(2 each) = 5; PkgLength = 1+5 = 6.
+    std.debug.assert(s5_aml[6] == 6);
+    std.debug.assert(s5_aml.len == 12);
+}
 
 // The Generic Address Structure is 12 bytes. The assert below confirms it.
 comptime {
@@ -127,11 +155,16 @@ fn writeGas(dst: []u8, off: usize, port: u16) void {
     std.mem.writeInt(u64, dst[off + 4 ..][0..8], port, .little);
 }
 
-/// Build an RSDP, XSDT, and hardware-reduced FADT into `buf` at guest
-/// physical address `base_phys`. Returns the bytes written and the RSDP's
-/// physical address as the Builder placed it.
+/// Build an RSDP, XSDT, hardware-reduced FADT, and DSDT carrying _S5 into
+/// `buf` at guest physical address `base_phys`. Returns the bytes written and
+/// the RSDP's physical address as the Builder placed it.
 pub fn build(buf: []u8, base_phys: u64, opts: Options) !Built {
     var b = almanac.Builder.init(buf, base_phys);
+
+    // The DSDT is placed before the FADT so its physical address is known when
+    // the FADT's DSDT and X_DSDT fields are written. The DSDT is referenced
+    // only by the FADT and is never listed in the XSDT (ACPI rule).
+    const dsdt_phys = try b.addTable("DSDT", &s5_aml, 2);
 
     // Build the FADT body by hand because almanac's fadt() helper does not set
     // the sleep-control/status registers.
@@ -151,9 +184,10 @@ pub fn build(buf: []u8, base_phys: u64, opts: Options) !Built {
     @memcpy(fadt_bytes[28..32], "ALMA");
     std.mem.writeInt(u32, fadt_bytes[32..36], 1, .little);
 
-    // DSDT (32-bit, offset 40) and X_DSDT (64-bit, offset 140).
-    std.mem.writeInt(u32, fadt_bytes[40..44], @truncate(opts.dsdt_phys), .little);
-    std.mem.writeInt(u64, fadt_bytes[140..148], opts.dsdt_phys, .little);
+    // DSDT (32-bit, offset 40) and X_DSDT (64-bit, offset 140) point at the
+    // DSDT placed above.
+    std.mem.writeInt(u32, fadt_bytes[40..44], @truncate(dsdt_phys), .little);
+    std.mem.writeInt(u64, fadt_bytes[140..148], dsdt_phys, .little);
 
     // Flags at offset 112: set HW_REDUCED_ACPI.
     std.mem.writeInt(u32, fadt_bytes[112..116], flag_hw_reduced, .little);
@@ -248,6 +282,39 @@ test "the fadt names the sleep port" {
     const g = almanac.Gas.fromBytes(gas_bytes);
     try testing.expectEqual(@as(u8, 1), g.address_space); // SystemIO
     try testing.expectEqual(sleep_port, @as(u16, @intCast(g.address)));
+}
+
+test "the dsdt carries an s5 package the fadt points at" {
+    var buf: [4096]u8 align(16) = undefined;
+    const base: u64 = 0x80000;
+    const built = try build(&buf, base, .{});
+
+    const Tables = almanac.TablesGeneric(almanac.OffsetMapper);
+    const offset: u64 = @intFromPtr(&buf) -% base;
+    const tabs = try Tables.init(.{ .offset = offset }, built.rsdp);
+
+    // The FADT must point at a non-zero DSDT address.
+    const fadt = (try tabs.findAs(almanac.Fadt)).?;
+    const dsdt_addr = fadt.preferredDsdt();
+    try std.testing.expect(dsdt_addr != 0);
+
+    // Read the DSDT bytes via the offset mapper and spot-check the _S5 AML.
+    // The DSDT begins with a 36-byte SDT header; the AML body follows.
+    const dsdt_total = 36 + s5_aml.len;
+    const dsdt_bytes = (almanac.OffsetMapper{ .offset = offset }).slice(dsdt_addr, dsdt_total);
+    // Verify signature "DSDT" in the header.
+    try std.testing.expect(std.mem.eql(u8, dsdt_bytes[0..4], "DSDT"));
+    // The AML body starts at byte 36. Spot-check: NameOp, "_S5_", PackageOp,
+    // PkgLength, and the two SLP_TYP bytes.
+    const aml_body = dsdt_bytes[36..];
+    try std.testing.expect(aml_body[0] == 0x08); // NameOp
+    try std.testing.expect(std.mem.eql(u8, aml_body[1..5], "_S5_")); // NameSeg
+    try std.testing.expect(aml_body[5] == 0x12); // PackageOp
+    try std.testing.expect(aml_body[6] == 0x06); // PkgLength = 6
+    try std.testing.expect(aml_body[8] == almanac.aml.encoding.byte_prefix); // SLP_TYPa prefix
+    try std.testing.expect(aml_body[9] == s5_slp_typ); // SLP_TYPa = 5
+    try std.testing.expect(aml_body[10] == almanac.aml.encoding.byte_prefix); // SLP_TYPb prefix
+    try std.testing.expect(aml_body[11] == s5_slp_typ); // SLP_TYPb = 5
 }
 
 test {
