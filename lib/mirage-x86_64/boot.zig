@@ -155,11 +155,11 @@ comptime {
 }
 
 // The Linux zero page carries `acpi_rsdp_addr` (u64) at offset 0x070.
+const acpi_rsdp_addr_offset: u64 = 0x070;
 // Pin this offset so a layout change is caught at compile time.
 comptime {
     std.debug.assert(acpi_rsdp_addr_offset == 0x070);
 }
-const acpi_rsdp_addr_offset: u64 = 0x070;
 
 /// Fixed GPA where the initrd is placed. The kernel loads at the one megabyte mark and relocates and
 /// decompresses itself into the memory above, a working set that reaches tens of megabytes for a real
@@ -204,6 +204,8 @@ fn writeE820(memory: *GuestMemory, boot_params: u64, index: *usize, base: u64, l
 ///
 /// The caller provides the memory map through memory.regions; each region
 /// becomes one usable e820 entry.
+///
+/// Returns OutOfSpace when the ACPI window was too small for the tables.
 pub fn buildBootParams(
     memory: *GuestMemory,
     header: SetupHeader,
@@ -228,10 +230,10 @@ pub fn buildBootParams(
     // the kernel finds it without scanning for the "RSD PTR " signature.
     {
         var acpi_buf: [4096]u8 align(16) = undefined;
-        const acpi_bytes = try acpi.build(&acpi_buf, acpi_base, .{});
-        try memory.write(acpi_base, acpi_bytes);
+        const built = try acpi.build(&acpi_buf, acpi_base, .{});
+        try memory.write(acpi_base, built.bytes);
         var rsdp_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &rsdp_buf, acpi.rsdp_phys(acpi_base), .little);
+        std.mem.writeInt(u64, &rsdp_buf, built.rsdp, .little);
         try memory.write(low.boot_params + acpi_rsdp_addr_offset, &rsdp_buf);
     }
 
@@ -694,5 +696,10 @@ test "boot_params records the acpi rsdp address" {
     var rsdp_buf: [8]u8 = undefined;
     try memory.read(default_low.boot_params + acpi_rsdp_addr_offset, &rsdp_buf);
     const recorded = std.mem.readInt(u64, &rsdp_buf, .little);
-    try testing.expectEqual(acpi.rsdp_phys(acpi_base), recorded);
+
+    // The recorded address must match what acpi.build reports for the same
+    // base_phys, which is deterministic for a given table set.
+    var expect_buf: [4096]u8 align(16) = undefined;
+    const built = try acpi.build(&expect_buf, acpi_base, .{});
+    try testing.expectEqual(built.rsdp, recorded);
 }

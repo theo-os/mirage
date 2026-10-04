@@ -18,6 +18,14 @@ pub const Options = struct {
     dsdt_phys: u64 = 0,
 };
 
+/// The result of building the table set: the bytes to copy into guest RAM and
+/// the physical address of the RSDP, reported by the Builder rather than
+/// recomputed, so adding tables cannot desync where the RSDP lands.
+pub const Built = struct {
+    bytes: []u8,
+    rsdp: u64,
+};
+
 // The FADT is 276 bytes (ACPI 6.x). Layout is fixed by the spec; fields are
 // written by offset using std.mem.writeInt. Asserts below pin every field used.
 const fadt_size: usize = 276;
@@ -51,8 +59,9 @@ fn writeGas(dst: []u8, off: usize, port: u16) void {
 }
 
 /// Build an RSDP, XSDT, and hardware-reduced FADT into `buf` at guest
-/// physical address `base_phys`. Returns the bytes written (Builder.finish()).
-pub fn build(buf: []u8, base_phys: u64, opts: Options) ![]u8 {
+/// physical address `base_phys`. Returns the bytes written and the RSDP's
+/// physical address as the Builder placed it.
+pub fn build(buf: []u8, base_phys: u64, opts: Options) !Built {
     var b = almanac.Builder.init(buf, base_phys);
 
     // Build the FADT body by hand because almanac's fadt() helper does not set
@@ -92,44 +101,21 @@ pub fn build(buf: []u8, base_phys: u64, opts: Options) ![]u8 {
 
     const fadt_phys = try b.addRaw(&fadt_bytes);
     const xsdt_phys = try b.xsdt(&.{fadt_phys});
-    _ = try b.rsdp(xsdt_phys);
+    const rsdp = try b.rsdp(xsdt_phys);
 
-    return b.finish();
-}
-
-/// The physical address the RSDP will occupy when the table set is built at
-/// `base_phys`. The Builder places the RSDP last, after a 276-byte FADT
-/// (aligned to 8), a variable-size XSDT (aligned to 8), and a 36-byte RSDP
-/// (aligned to 16). Matches the offset the Builder produces.
-///
-/// Layout (all offsets relative to base_phys; `off` tracks Builder.alloc state):
-///   off=0   -> FADT start (align 8, already aligned)
-///   off=276 -> FADT end
-///   off=280 -> XSDT start (alignForward(276, 8) = 280 = 0x118)
-///   off=324 -> XSDT end   (280 + 44 bytes = 324 = 0x144)
-///   off=336 -> RSDP start (alignForward(324, 16) = 336 = 0x150)
-pub fn rsdp_phys(base_phys: u64) u64 {
-    // FADT: starts at 0, length 276. off after = 276.
-    const after_fadt: u64 = 276;
-    // XSDT: starts at alignForward(276, 8) = 280, length = 36 + 1*8 = 44. off after = 324.
-    const xsdt_start: u64 = std.mem.alignForward(u64, after_fadt, 8);
-    const after_xsdt: u64 = xsdt_start + (36 + 1 * 8);
-    // RSDP: starts at alignForward(324, 16) = 336 = 0x150.
-    const rsdp_start: u64 = std.mem.alignForward(u64, after_xsdt, 16);
-    return base_phys + rsdp_start;
+    return .{ .bytes = b.finish(), .rsdp = rsdp };
 }
 
 test "the acpi set has a hw-reduced fadt discoverable from the rsdp" {
     var buf: [4096]u8 align(16) = undefined;
     const base: u64 = 0x80000;
-    const bytes = try build(&buf, base, .{});
-    _ = bytes;
+    const built = try build(&buf, base, .{});
     const Tables = almanac.TablesGeneric(almanac.OffsetMapper);
     // The OffsetMapper maps phys -> virt by adding the offset. We want:
     //   virt = @intFromPtr(&buf) + (phys - base)
     //        = phys + (@intFromPtr(&buf) - base)
     const offset: u64 = @intFromPtr(&buf) -% base;
-    const tabs = try Tables.init(.{ .offset = offset }, rsdp_phys(base));
+    const tabs = try Tables.init(.{ .offset = offset }, built.rsdp);
     try std.testing.expect(tabs.usesXsdt());
     const fadt = (try tabs.findAs(almanac.Fadt)).?;
     try std.testing.expect(fadt.isHwReduced());
@@ -138,12 +124,11 @@ test "the acpi set has a hw-reduced fadt discoverable from the rsdp" {
 test "the fadt names the sleep port" {
     var buf: [4096]u8 align(16) = undefined;
     const base: u64 = 0x80000;
-    const bytes = try build(&buf, base, .{});
-    _ = bytes;
+    const built = try build(&buf, base, .{});
 
     const Tables = almanac.TablesGeneric(almanac.OffsetMapper);
     const offset: u64 = @intFromPtr(&buf) -% base;
-    const tabs = try Tables.init(.{ .offset = offset }, rsdp_phys(base));
+    const tabs = try Tables.init(.{ .offset = offset }, built.rsdp);
     const fadt = (try tabs.findAs(almanac.Fadt)).?;
 
     // SLEEP_CONTROL_REG is at FADT byte offset 244.
