@@ -604,7 +604,7 @@ const virtio_window_size: u32 = 0x200;
 
 /// Build the ACPI virtio device list from the Config device flags. Returns a slice of a
 /// caller-owned fixed array, so no allocation is needed.
-fn virtioDevicesFromConfig(config: Config, buf: *[4]acpi.VirtioDevice) []const acpi.VirtioDevice {
+fn virtioDevicesFromConfig(config: Config, buf: *[5]acpi.VirtioDevice) []const acpi.VirtioDevice {
     var count: usize = 0;
     if (config.block_device) {
         buf[count] = .{ .addr = platform.virtio.addr, .size = virtio_window_size, .gsi = platform.virtio.intid };
@@ -620,6 +620,10 @@ fn virtioDevicesFromConfig(config: Config, buf: *[4]acpi.VirtioDevice) []const a
     }
     if (config.net) {
         buf[count] = .{ .addr = platform.net.addr, .size = virtio_window_size, .gsi = platform.net.intid };
+        count += 1;
+    }
+    if (config.share) {
+        buf[count] = .{ .addr = platform.fs.addr, .size = virtio_window_size, .gsi = platform.fs.intid };
         count += 1;
     }
     return buf[0..count];
@@ -706,7 +710,7 @@ pub fn prepare(
         };
     }
 
-    var virtio_buf: [4]acpi.VirtioDevice = undefined;
+    var virtio_buf: [5]acpi.VirtioDevice = undefined;
     const virtio = virtioDevicesFromConfig(config, &virtio_buf);
     try buildBootParams(memory, parsed.header, config.cmdline, config.initrd, low, config.cpus, virtio, tpm_desc);
     try buildLongMode(memory, low, config.ram_size);
@@ -864,7 +868,7 @@ test "boot params build a dsdt with the given virtio device" {
 
 test "the x86 acpi device list follows the device flags" {
     // block + balloon present, vsock + net absent.
-    var buf: [4]acpi.VirtioDevice = undefined;
+    var buf: [5]acpi.VirtioDevice = undefined;
     const list = virtioDevicesFromConfig(.{
         .kernel = &.{},
         .cmdline = "",
@@ -885,7 +889,7 @@ test "the x86 acpi device list follows the device flags" {
     try testing.expectEqual(@as(u32, 18), list[1].gsi);
 
     // All flags off: empty list.
-    var buf2: [4]acpi.VirtioDevice = undefined;
+    var buf2: [5]acpi.VirtioDevice = undefined;
     const empty = virtioDevicesFromConfig(.{
         .kernel = &.{},
         .cmdline = "",
@@ -896,6 +900,38 @@ test "the x86 acpi device list follows the device flags" {
         .block_device = false,
     }, &buf2);
     try testing.expectEqual(@as(usize, 0), empty.len);
+
+    // share=true adds the fs device after any others.
+    var buf3: [5]acpi.VirtioDevice = undefined;
+    const with_share = virtioDevicesFromConfig(.{
+        .kernel = &.{},
+        .cmdline = "",
+        .ram_base = 0,
+        .ram_size = 0,
+        .cpus = 1,
+        .uart_base = 0,
+        .block_device = true,
+        .share = true,
+    }, &buf3);
+    try testing.expectEqual(@as(usize, 2), with_share.len);
+    try testing.expectEqual(@as(u64, platform.fs.addr), with_share[1].addr);
+    try testing.expectEqual(@as(u32, virtio_window_size), with_share[1].size);
+    try testing.expectEqual(@as(u32, platform.fs.intid), with_share[1].gsi);
+
+    // share=false does not add the fs device.
+    var buf4: [5]acpi.VirtioDevice = undefined;
+    const no_share = virtioDevicesFromConfig(.{
+        .kernel = &.{},
+        .cmdline = "",
+        .ram_base = 0,
+        .ram_size = 0,
+        .cpus = 1,
+        .uart_base = 0,
+        .block_device = true,
+        .share = false,
+    }, &buf4);
+    try testing.expectEqual(@as(usize, 1), no_share.len);
+    try testing.expectEqual(@as(u64, platform.virtio.addr), no_share[0].addr);
 }
 
 test "x86 boot reserves a measurement log and names it in the tpm2 table" {
