@@ -75,6 +75,71 @@ pub const CreateGuestMemfd = extern struct {
     reserved: [6]u64,
 };
 
+/// `KVM_MEMORY_ENCRYPT_OP` envelope, 24 bytes. `data` is a userspace pointer to the
+/// sub-command struct; `error` is the firmware error out-param.
+pub const KvmSevCmd = extern struct {
+    id: u32,
+    pad0: u32 = 0,
+    data: u64,
+    @"error": u32 = 0,
+    pad1: u32 = 0,
+
+    comptime {
+        std.debug.assert(@sizeOf(KvmSevCmd) == 24);
+    }
+};
+
+/// `kvm_sev_init` for `KVM_SEV_INIT2`. Pass all-zero for plain SEV.
+pub const KvmSevInit = extern struct {
+    vmsa_features: u64,
+    flags: u32,
+    ghcb_version: u16,
+    pad1: u16,
+    pad2: [8]u32,
+
+    comptime {
+        std.debug.assert(@sizeOf(KvmSevInit) == 48);
+    }
+};
+
+/// `kvm_sev_launch_start` for `KVM_SEV_LAUNCH_START`.
+pub const KvmSevLaunchStart = extern struct {
+    handle: u32,
+    policy: u32,
+    dh_uaddr: u64,
+    dh_len: u32,
+    pad0: u32 = 0,
+    session_uaddr: u64,
+    session_len: u32,
+    pad1: u32 = 0,
+
+    comptime {
+        std.debug.assert(@sizeOf(KvmSevLaunchStart) == 40);
+    }
+};
+
+/// `kvm_sev_launch_update_data` for `KVM_SEV_LAUNCH_UPDATE_DATA`.
+pub const KvmSevLaunchUpdateData = extern struct {
+    uaddr: u64,
+    len: u32,
+    pad0: u32 = 0,
+
+    comptime {
+        std.debug.assert(@sizeOf(KvmSevLaunchUpdateData) == 16);
+    }
+};
+
+/// `kvm_sev_launch_measure` for `KVM_SEV_LAUNCH_MEASURE`.
+pub const KvmSevLaunchMeasure = extern struct {
+    uaddr: u64,
+    len: u32,
+    pad0: u32 = 0,
+
+    comptime {
+        std.debug.assert(@sizeOf(KvmSevLaunchMeasure) == 16);
+    }
+};
+
 pub const UserspaceMemoryRegion2 = extern struct {
     slot: u32,
     flags: u32,

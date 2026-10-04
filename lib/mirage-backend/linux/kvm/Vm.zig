@@ -29,6 +29,15 @@ const nr = struct {
     const create_pit2 = 0x77;
     const create_guest_memfd = 0xd4;
     const set_user_memory_region2 = 0x49;
+    const memory_encrypt_op = 0xba;
+};
+
+const sev_cmd_id = struct {
+    const init2: u32 = 22;
+    const launch_start: u32 = 2;
+    const launch_update_data: u32 = 3;
+    const launch_measure: u32 = 6;
+    const launch_finish: u32 = 7;
 };
 
 /// `struct kvm_pit_config`: one word of flags and fifteen reserved, sixty four bytes in all.
@@ -84,6 +93,7 @@ pub const Error = error{
     TooManySlots,
     Misaligned,
     PrivateMemoryUnsupported,
+    SevFirmwareError,
 } || ioctl.Error || std.posix.MMapError;
 
 const Slot = struct {
@@ -102,6 +112,10 @@ slots: u32 = 0,
 owned: [max_slots]Slot = @splat(.{}),
 
 pub fn create() Error!Vm {
+    return createWithType(0);
+}
+
+pub fn createWithType(vm_type: u64) Error!Vm {
     const opened = linux.open("/dev/kvm", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
     if (std.posix.errno(opened) != .SUCCESS) return Error.NoKvm;
     const kvm: std.posix.fd_t = @intCast(opened);
@@ -109,24 +123,83 @@ pub fn create() Error!Vm {
 
     // Machine type zero asks for this host's default intermediate physical address
     // size. aarch64 encodes a wider address space in the low bits of this argument.
-    const raw = try ioctl.call(kvm, comptime ioctl.request(.none, void, nr.create_vm), 0);
+    const raw = try ioctl.call(kvm, comptime ioctl.request(.none, void, nr.create_vm), vm_type);
     const vm_fd: std.posix.fd_t = @intCast(raw);
     errdefer _ = linux.close(vm_fd);
 
     // On x86 the in-kernel PIC, IOAPIC, and per-vcpu LAPIC are built here, before
     // any vcpu exists. The kernel requires that order. On arm the GIC fills this
     // role and is created separately via Gic.zig; nothing changes on that path.
+    // A SEV VM (type 2) must not create the in-kernel irqchip or PIT here;
+    // those are set up after sevInit2 and launchFinish.
     if (comptime builtin.cpu.arch == .x86_64) {
-        _ = try ioctl.call(vm_fd, comptime ioctl.request(.none, void, nr.create_irqchip), 0);
+        if (vm_type == 0) {
+            _ = try ioctl.call(vm_fd, comptime ioctl.request(.none, void, nr.create_irqchip), 0);
 
-        // The in-kernel timer the guest's clock needs. Without it the kernel reaches userspace but
-        // its timekeeping never advances, so the first process makes no progress. The LAPIC timer is
-        // not enough here: the kernel calibrates against this one first.
-        const pit: PitConfig = .{ .flags = 0, .pad = @splat(0) };
-        _ = try ioctl.call(vm_fd, comptime ioctl.request(.write, PitConfig, nr.create_pit2), @intFromPtr(&pit));
+            // The in-kernel timer the guest's clock needs. Without it the kernel reaches userspace but
+            // its timekeeping never advances, so the first process makes no progress. The LAPIC timer is
+            // not enough here: the kernel calibrates against this one first.
+            const pit: PitConfig = .{ .flags = 0, .pad = @splat(0) };
+            _ = try ioctl.call(vm_fd, comptime ioctl.request(.write, PitConfig, nr.create_pit2), @intFromPtr(&pit));
+        }
     }
 
     return .{ .kvm = kvm, .fd = vm_fd };
+}
+
+fn sevCmd(self: *Vm, id: u32, data: u64) Error!void {
+    var cmd: ioctl.KvmSevCmd = .{ .id = id, .data = data };
+    _ = try ioctl.call(
+        self.fd,
+        comptime ioctl.request(.read_write, u64, nr.memory_encrypt_op),
+        @intFromPtr(&cmd),
+    );
+    if (cmd.@"error" != 0) return Error.SevFirmwareError;
+}
+
+pub fn sevInit2(self: *Vm) Error!void {
+    var args: ioctl.KvmSevInit = .{
+        .vmsa_features = 0,
+        .flags = 0,
+        .ghcb_version = 0,
+        .pad1 = 0,
+        .pad2 = @splat(0),
+    };
+    try self.sevCmd(sev_cmd_id.init2, @intFromPtr(&args));
+}
+
+pub fn launchStart(self: *Vm, policy: u32) Error!void {
+    var args: ioctl.KvmSevLaunchStart = .{
+        .handle = 0,
+        .policy = policy,
+        .dh_uaddr = 0,
+        .dh_len = 0,
+        .session_uaddr = 0,
+        .session_len = 0,
+    };
+    try self.sevCmd(sev_cmd_id.launch_start, @intFromPtr(&args));
+}
+
+pub fn launchUpdateData(self: *Vm, uaddr: u64, len: u64) Error!void {
+    var args: ioctl.KvmSevLaunchUpdateData = .{
+        .uaddr = uaddr,
+        .len = @intCast(len),
+    };
+    try self.sevCmd(sev_cmd_id.launch_update_data, @intFromPtr(&args));
+}
+
+pub fn launchMeasure(self: *Vm, buf: []u8) Error![]u8 {
+    var args: ioctl.KvmSevLaunchMeasure = .{ .uaddr = 0, .len = 0 };
+    try self.sevCmd(sev_cmd_id.launch_measure, @intFromPtr(&args));
+    const needed = args.len;
+    if (needed == 0 or needed > buf.len) return buf[0..0];
+    args = .{ .uaddr = @intFromPtr(buf.ptr), .len = needed };
+    try self.sevCmd(sev_cmd_id.launch_measure, @intFromPtr(&args));
+    return buf[0..needed];
+}
+
+pub fn launchFinish(self: *Vm) Error!void {
+    try self.sevCmd(sev_cmd_id.launch_finish, 0);
 }
 
 pub fn deinit(self: *Vm) void {
@@ -296,4 +369,17 @@ test "an x86 vm accepts an injected irq line" {
     // Raising and lowering a GSI must not error; the in-kernel irqchip routes it.
     try vm.setIrq(5, true);
     try vm.setIrq(5, false);
+}
+
+test "a sev vm initialises as the normal user" {
+    if (comptime builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var vm = Vm.createWithType(2) catch |err| switch (err) {
+        error.NoKvm, error.NotSupported, error.PermissionDenied, error.InvalidArgument => return error.SkipZigTest,
+        else => return err,
+    };
+    defer vm.deinit();
+    vm.sevInit2() catch |err| switch (err) {
+        error.NotSupported, error.PermissionDenied, error.InvalidArgument, error.SevFirmwareError => return error.SkipZigTest,
+        else => return err,
+    };
 }
