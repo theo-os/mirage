@@ -329,6 +329,10 @@ pub fn build(b: *std.Build) void {
         // guest gets no chip, because a chip nothing answers is worse than none.
         const chip_socket = b.option([]const u8, "tpm", "Socket of a program answering chip commands") orelse "";
         boot_options.addOption([]const u8, "chip_socket", chip_socket);
+        // Where the x86 tpm gate finds a swtpm binary to spawn. swtpm is not on the default PATH
+        // here, so the gate takes its path; the default lets it be found if it is.
+        const swtpm = b.option([]const u8, "swtpm", "Path to a swtpm binary for the x86 tpm gate") orelse "swtpm";
+        boot_options.addOption([]const u8, "swtpm_path", swtpm);
         boot_options.addOption(u32, "cpus", cpus);
         // Where a guest is stopped and moved, in exits. Different points leave it with different
         // state in flight, so a snapshot that works at one is not proof it works at all of them.
@@ -444,6 +448,18 @@ pub fn build(b: *std.Build) void {
         });
         b.step("test-x86balloon", "Boot a real x86 kernel and inflate a balloon under KVM")
             .dependOn(&b.addRunArtifact(x86balloon_tests).step);
+
+        // The x86 tpm gate: spawn swtpm, measure the launch into a TPM, boot the guest with the TPM
+        // (via a TPM2 ACPI table) + vsock, and verify the launch chain the guest reports matches the
+        // host's. Needs `-Dkernel=` a kernel with TCG_TIS + virtio-vsock built in and a swtpm binary
+        // (-Dswtpm=<path>); skips otherwise. Its own step so `zig build test` needs no x86 kernel.
+        const x86tpm_tests = b.addTest(.{
+            .name = "x86tpm",
+            .root_module = x86boot_module,
+            .filters = &.{"launch chain through a tpm"},
+        });
+        b.step("test-x86tpm", "Boot a real x86 kernel and verify its launch chain through a tpm under KVM")
+            .dependOn(&b.addRunArtifact(x86tpm_tests).step);
 
         // Stops a guest, moves it to a machine that has never run, and lets it carry on. Its own
         // target because it needs a kernel and because what it proves is separate.

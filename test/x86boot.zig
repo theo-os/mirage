@@ -63,6 +63,13 @@ const gateway_mac = [6]u8{ 0x52, 0x54, 0x00, 0x12, 0x34, 0x57 };
 const balloon_addr = 0xd000_0400;
 const balloon_intid = 18;
 
+/// The TPM sits at the standard x86 TCG TIS base. The guest finds it through the TPM2 ACPI table the
+/// boot path emits (control address = this), and reads the launch register the host extended.
+const tpm_addr = 0xfed4_0000;
+
+/// The register a launch is folded into, the one the host extends and the guest reads back.
+const launch_register = 0;
+
 /// The address the guest answers to, and the port both sides agreed on. The guest-init holds the
 /// same two numbers, and a channel where one side disagrees is a channel nobody answers.
 const guest_cid = 3;
@@ -995,4 +1002,238 @@ test "an x86 guest hands memory back through a balloon" {
     // completions it only saw over the interrupt line. A quarter of RAM is far past a single batch,
     // so reaching it is proof a real driver drove the device, not a fixture.
     try std.testing.expect(handed_over >= ram_size / 4);
+}
+
+/// Spawn swtpm on a fresh state dir with a unix server socket. Returns the child pid, or null if the
+/// fork failed. The caller connects to the server socket and kills the pid when done. fork then
+/// execve is safe even with the test's threads, because execve replaces the child whole.
+fn spawnSwtpm(dir_z: [*:0]const u8, swtpm_z: [*:0]const u8, state_arg: [*:0]const u8, server_arg: [*:0]const u8, ctrl_arg: [*:0]const u8) ?linux.pid_t {
+    _ = linux.mkdir(dir_z, 0o700); // an existing dir is fine; a real failure surfaces as a bad connect
+
+    const pid = linux.fork();
+    if (@as(isize, @bitCast(pid)) < 0) return null;
+    if (pid == 0) {
+        const argv = [_:null]?[*:0]const u8{
+            swtpm_z,     "socket",     "--tpm2",
+            "--tpmstate", state_arg,   "--server",
+            server_arg,  "--ctrl",     ctrl_arg,
+            "--flags",   "not-need-init,startup-clear",
+        };
+        const envp = [_:null]?[*:0]const u8{};
+        _ = linux.execve(swtpm_z, &argv, &envp);
+        linux.exit(127);
+    }
+    return @intCast(pid);
+}
+
+test "an x86 guest proves its launch chain through a tpm" {
+    if (@import("builtin").cpu.arch != .x86_64) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+
+    const kernel = (try mapKernel()) orelse return error.SkipZigTest;
+    defer std.posix.munmap(kernel);
+
+    // A fresh swtpm per run, so its registers start at zero (measure refuses a non-fresh register).
+    var dir_buf: [128:0]u8 = undefined;
+    const dir = std.fmt.bufPrintZ(&dir_buf, "/tmp/mirage-x86tpm-{d}-{d}", .{ linux.getpid(), nowMs() }) catch return error.SkipZigTest;
+    var data_buf: [160:0]u8 = undefined;
+    const data_sock = std.fmt.bufPrintZ(&data_buf, "{s}/data", .{dir}) catch return error.SkipZigTest;
+    var ctrl_buf: [160:0]u8 = undefined;
+    const ctrl_sock = std.fmt.bufPrintZ(&ctrl_buf, "{s}/ctrl", .{dir}) catch return error.SkipZigTest;
+    var swtpm_buf: [512:0]u8 = undefined;
+    const swtpm_z = std.fmt.bufPrintZ(&swtpm_buf, "{s}", .{options.swtpm_path}) catch return error.SkipZigTest;
+    var state_buf: [192:0]u8 = undefined;
+    const state_arg = std.fmt.bufPrintZ(&state_buf, "dir={s}", .{dir}) catch return error.SkipZigTest;
+    var server_buf: [192:0]u8 = undefined;
+    const server_arg = std.fmt.bufPrintZ(&server_buf, "type=unixio,path={s}", .{data_sock}) catch return error.SkipZigTest;
+    var ctrlarg_buf: [192:0]u8 = undefined;
+    const ctrl_arg = std.fmt.bufPrintZ(&ctrlarg_buf, "type=unixio,path={s}", .{ctrl_sock}) catch return error.SkipZigTest;
+
+    const swtpm_pid = spawnSwtpm(dir, swtpm_z, state_arg, server_arg, ctrl_arg) orelse {
+        std.debug.print("\nnote: could not spawn swtpm (pass -Dswtpm=<path>); skipping the tpm gate.\n", .{});
+        return error.SkipZigTest;
+    };
+    defer _ = linux.kill(swtpm_pid, .KILL);
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Wait for swtpm to create its server socket, then connect. Bounded so a swtpm that never starts
+    // does not hang the gate.
+    var link: netmod.Socket = connect: {
+        const until = nowMs() + 5_000;
+        while (nowMs() < until) {
+            if (netmod.Socket.connect(io, data_sock)) |s| break :connect s else |_| {}
+        }
+        std.debug.print("\nnote: swtpm did not accept a connection; skipping the tpm gate.\n", .{});
+        return error.SkipZigTest;
+    };
+    defer link.close(io);
+
+    var machine = backend.kvm.Machine.create(gpa, 1) catch |err| switch (err) {
+        error.NoKvm => return error.SkipZigTest,
+        else => return err,
+    };
+    defer machine.deinit();
+
+    const region = try machine.vm.addMemory(ram_base, ram_size, .shared);
+    var regions = [_]GuestMemory.Region{region};
+    var memory: GuestMemory = .{ .regions = &regions };
+
+    const hv = machine.backend();
+    const id = try hv.addVcpu();
+
+    var controller = try backend.platform.createController(&machine.vm, 1);
+    defer controller.deinit();
+    const line = backend.platform.controllerLine(&controller);
+
+    var manifest: Manifest = .{};
+    defer manifest.deinit(gpa);
+
+    var archive: image.Cpio = .init(gpa);
+    defer archive.deinit();
+    try archive.addDirectory("dev", 0o755);
+    try archive.addCharacterDevice("dev/console", 0o600, 5, 1);
+    try archive.addFile("init", 0o755, guest_init);
+    const initrd = try archive.finish();
+    defer gpa.free(initrd);
+
+    // Place and measure the launch. The boot path extends nothing itself: it names the inputs in the
+    // manifest and writes the event log. The chip gets the same inputs below, before the guest runs.
+    const layout = try core.Launch.prepare(gpa, &memory, &manifest, .{
+        .kernel = kernel,
+        .initrd = initrd,
+        .cmdline = "console=ttyS0 earlyprintk=serial,ttyS0 panic=-1 rdinit=/init",
+        .ram_base = ram_base,
+        .ram_size = ram_size,
+        .cpus = 1,
+        .uart_base = serial_port,
+        // The declared devices: the TPM (TPM2 table + event log) and the vsock channel.
+        .tpm = true,
+        .vsock = true,
+        .block_device = false,
+    });
+
+    // Fold the launch into the chip before the guest runs, the way firmware does, and take a signed
+    // quote. The guest reads the same register below and must report the same chain.
+    var session: attest.Chain.Session(netmod.Socket) = .{ .transport = &link };
+    const expected_chain = session.measure(&manifest, launch_register) catch |err| {
+        std.debug.print("\nnote: the chip would not take the launch: {t}, code {x}; skipping.\n", .{ err, session.refusal });
+        return error.SkipZigTest;
+    };
+    {
+        var room: [1024]u8 = undefined;
+        const nonce = "the number this gate chose";
+        const taken = attest.Quote.take(&session, &room, launch_register, nonce, expected_chain) catch |err| {
+            std.debug.print("\nnote: the chip would not quote: {t}, code {x}; skipping.\n", .{ err, session.refusal });
+            return error.SkipZigTest;
+        };
+        // A quote only proves something if a check against the wrong value fails.
+        var other = expected_chain;
+        other[0] ^= 1;
+        try std.testing.expectError(attest.Quote.Error.Wrong, attest.Quote.check(taken.answer, taken.key, nonce, other));
+        try std.testing.expectError(attest.Quote.Error.Wrong, attest.Quote.check(taken.answer, taken.key, "a number nobody asked", expected_chain));
+    }
+
+    const output = try gpa.alloc(u8, 256 << 10);
+    defer gpa.free(output);
+    var sink = std.Io.Writer.fixed(output);
+    var serial: device.Uart16550 = .{ .sink = &sink };
+    var acpi_shutdown: device.AcpiShutdown = .{ .slp_typ = acpi.s5_slp_typ };
+
+    // The chip answers reads and writes only, so it is on the bus and needs no service.
+    var chip: device.Tpm = .{};
+    var chip_relay: device.Tpm.Relay(netmod.Socket) = .{};
+
+    var listening = [_]u32{host_port};
+    var channel: device.virtio.Vsock = undefined;
+    channel.init(guest_cid, &listening);
+
+    var port_devices = [_]device.Bus.Device{ serial.device(serial_port), acpi_shutdown.device(acpi.sleep_port) };
+    var ports: device.Bus = .{ .devices = &port_devices };
+    var mmio_devices = [_]device.Bus.Device{ channel.device(vsock_addr), chip.device(tpm_addr) };
+    var bus: device.Bus = .{ .devices = &mmio_devices };
+
+    var services = [_]device.Service{ serial.service(serial_irq), channel.service(vsock_intid) };
+
+    try arch.boot.enter(&machine.vcpus[id], layout);
+
+    const deadline = nowMs() + 20_000;
+    armTicks(10);
+
+    var exits: usize = 0;
+    var open: ?device.virtio.Vsock.Handle = null;
+    var heard: [256]u8 = undefined;
+    var heard_len: usize = 0;
+    while (exits < max_exits) : (exits += 1) {
+        if (exits % 1024 == 0 and nowMs() > deadline) {
+            std.debug.print("\n=== deadline after {d} exits ===\n", .{exits});
+            break;
+        }
+
+        const exit = hv.run(id) catch |err| {
+            std.debug.print("\nrun failed after {d} exits: {t}, kvm said {?}\n", .{ exits, err, machine.fault });
+            break;
+        };
+
+        switch (exit) {
+            .port_out => |w| ports.write(w.port, w.size, w.value),
+            .port_in => |r| try hv.completeMmioRead(id, ports.read(r.port, r.size)),
+            .mmio_write => |w| bus.write(w.gpa, w.size, w.value),
+            .mmio_read => |r| try hv.completeMmioRead(id, bus.read(r.gpa, r.size)),
+            .interrupted => {},
+            else => break,
+        }
+
+        // Carry the guest's chip commands to swtpm and the answers back, and answer the channel.
+        chip_relay.carry(&chip, &link);
+        if (open == null) open = channel.accept();
+        if (open) |handle| heard_len += channel.read(handle, heard[heard_len..]);
+
+        try core.Launch.poll(services[0..services.len], &memory, line);
+
+        if (acpi_shutdown.requested) break;
+
+        if (sink.buffered().len + 512 > output.len) break;
+    }
+
+    const log = sink.buffered();
+
+    if (chip_relay.answered == 0) {
+        std.debug.print(
+            "\n=== after {d} exits, heard {d}, relay.answered 0 ===\n{s}\n=== end ===\n",
+            .{ exits, heard_len, log },
+        );
+        std.debug.print(
+            "\nnote: the guest did not use the tpm. This gate needs -Dkernel= a kernel with TCG_TIS + " ++
+                "virtio-vsock built in and -Dswtpm=<path>; skipping. See the B2b-2b memory.\n",
+            .{},
+        );
+        return error.SkipZigTest;
+    }
+
+    // The chain the guest read from its register, reported over vsock, must equal the one the host
+    // folded into the chip before the guest ran. This is the launch-chain proof: the guest can only
+    // make it agree by reading the same register the host extended.
+    const label = "chain ";
+    const at = std.mem.indexOf(u8, heard[0..heard_len], label) orelse {
+        std.debug.print("\nthe guest sent no chain over the channel\n{s}\n", .{log});
+        return error.TestUnexpectedResult;
+    };
+    const said = heard[at + label.len ..];
+    try std.testing.expect(said.len >= attest.Chain.length * 2);
+    var told: [attest.Chain.length]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&told, said[0 .. attest.Chain.length * 2]);
+    try std.testing.expectEqualSlices(u8, &expected_chain, &told);
+
+    // The chip did real work and stayed: a chip that only echoed, or a relay that ran dry, would not
+    // leave these so.
+    try std.testing.expect(!chip_relay.gone);
+    try std.testing.expectEqual(@as(u64, 0), chip.refused);
+
+    // Full parity: the guest read the measurement log the boot path left it through the TPM2 table
+    // and folded it to the same register, so it can account for what started it rather than be told.
+    try std.testing.expect(std.mem.indexOf(u8, log, "account: the list folds to the register") != null);
 }
