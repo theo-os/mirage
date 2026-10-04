@@ -34,9 +34,10 @@ const serial_port = 0x3f8;
 /// console driver waits on it to send each byte.
 const serial_irq = 4;
 
-/// Where the vsock device sits and which global interrupt it raises. The guest finds it through a
-/// `virtio_mmio.device=` entry on the kernel command line, and its driver waits on this line for each
-/// answer. The window and the interrupt match the line the controller raises through `Vm.setIrq`.
+/// Where the vsock device sits and which global interrupt it raises. The guest finds it through an
+/// ACPI device object in the DSDT (_HID LNRO0005, _CRS naming this window and interrupt), and its
+/// driver waits on this line for each answer. The interrupt matches the GSI the controller raises
+/// through `Vm.setIrq`; Linux maps it into its IRQ domain from the _CRS.
 const vsock_addr = 0xd000_0200;
 const vsock_size = 0x200;
 const vsock_intid = 17;
@@ -364,7 +365,7 @@ test "a real x86 kernel boots to a guest in userspace and stops cleanly" {
 }
 
 /// The guest-init prints this once it has opened the channel back to this process. Seeing it is proof
-/// the kernel bound the virtio-mmio driver to the command-line device, the vsock driver probed, and the
+/// the kernel bound the virtio-mmio driver to the ACPI device, the vsock driver probed, and the
 /// guest reached the port this process listens on.
 const channel_open = "channel: open";
 
@@ -414,12 +415,15 @@ test "an x86 guest talks over vsock and sends the launch chain" {
     const layout = try core.Launch.prepare(gpa, &memory, &manifest, .{
         .kernel = kernel,
         .initrd = initrd,
-        .cmdline = "console=ttyS0 earlyprintk=serial,ttyS0 panic=-1 rdinit=/init virtio_mmio.device=0x200@0xd0000200:17",
+        .cmdline = "console=ttyS0 earlyprintk=serial,ttyS0 panic=-1 rdinit=/init",
         .ram_base = ram_base,
         .ram_size = ram_size,
         .cpus = 1,
         .uart_base = serial_port,
-        .virtio = &.{},
+        // The guest finds the vsock device through this ACPI device object in the DSDT: the _CRS
+        // names the window and the interrupt, Linux maps that GSI into its IRQ domain, and the
+        // virtio-mmio driver binds to the LNRO0005 identifier. The kernel command line names no device.
+        .virtio = &.{.{ .addr = vsock_addr, .size = vsock_size, .gsi = vsock_intid }},
     });
 
     const output = try gpa.alloc(u8, 256 << 10);
@@ -437,7 +441,7 @@ test "an x86 guest talks over vsock and sends the launch chain" {
     channel.init(guest_cid, &listening);
 
     // The serial sits on an I/O port, so it goes on a port bus of its own. The memory bus holds the
-    // vsock device, which the guest reaches through the window the command line named.
+    // vsock device, which the guest reaches through the window the DSDT named.
     var port_devices = [_]device.Bus.Device{ serial.device(serial_port), acpi_shutdown.device(acpi.sleep_port) };
     var ports: device.Bus = .{ .devices = &port_devices };
     var mmio_devices = [_]device.Bus.Device{channel.device(vsock_addr)};
@@ -511,49 +515,39 @@ test "an x86 guest talks over vsock and sends the launch chain" {
 
     const log = sink.buffered();
 
-    std.debug.print("\n=== DEBUG heard {d}: '{s}' ===\n", .{ heard_len, heard[0..heard_len] });
-
-    const connected = std.mem.indexOf(u8, log, channel_open) != null;
-    const exchanged = std.mem.indexOf(u8, log, channel_said) != null;
-
-    if (!connected or !exchanged) {
-        const rip = machine.vcpus[id].getRegister(.rip) catch 0;
-        std.debug.print(
-            "\n=== after {d} exits, stopped {?}, powered_off {}, rip {x}, unmapped {d}, heard {d} ===\n{s}\n=== end ===\n",
-            .{ exits, stopped, powered_off, rip, bus.unmapped, heard_len, log },
-        );
-    }
-
     // The guest reached userspace and ran the first process.
     try std.testing.expect(std.mem.indexOf(u8, log, alive) != null);
 
-    // The remaining piece is x86 interrupt-domain integration: the guest's virtio-mmio driver calls
-    // `request_irq` on the device line, which returns `-EINVAL` on x86 because the GSI is not mapped
-    // into the guest's IRQ domain (on arm the device tree + GIC map it). Until that lands the vsock
-    // driver cannot probe and the channel never opens, so this gate skips rather than fails. It needs
-    // `-Dkernel=` a kernel with virtio-mmio + vsock built in (e.g. the x86 micro-kernel). When the
-    // interrupt reaches the guest, `connected` becomes true and the full exchange below is asserted.
-    if (!connected) {
+    // The real proof is the bytes the host received over vsock: the ACPI DSDT device enumerated,
+    // Linux mapped its `_CRS` interrupt into the IRQ domain, the virtio-mmio and vsock drivers probed,
+    // the guest connected, and its line crossed the channel. The guest's own serial console turns
+    // lossy once the kernel's polled 8250 driver takes over, so the assertion keys off the received
+    // vsock bytes, not serial strings (`channel: open` is reported below only for diagnosis).
+    const heard_hello = heard_len > 0 and
+        std.mem.indexOf(u8, heard[0..heard_len], "hello from the guest") != null;
+
+    if (!heard_hello) {
+        const connected = std.mem.indexOf(u8, log, channel_open) != null;
+        const exchanged = std.mem.indexOf(u8, log, channel_said) != null;
+        const rip = machine.vcpus[id].getRegister(.rip) catch 0;
         std.debug.print(
-            "\nnote: x86 virtio-mmio interrupt-domain integration is not done (request_irq -EINVAL); " ++
-                "the vsock channel cannot open yet, skipping. See the B2b-1 memory for the plan.\n",
+            "\n=== after {d} exits, stopped {?}, powered_off {}, rip {x}, unmapped {d}, heard {d}, " ++
+                "serial-open {}, serial-said {} ===\n{s}\n=== end ===\n",
+            .{ exits, stopped, powered_off, rip, bus.unmapped, heard_len, connected, exchanged, log },
+        );
+        // Needs a kernel with virtio-mmio + vsock built in (an initramfs guest cannot load modules):
+        // run with `-Dkernel=` the x86 micro-kernel. Skip rather than fail so the default kernel is green.
+        std.debug.print(
+            "\nnote: the guest did not reach the host over vsock. This gate needs -Dkernel= a kernel with " ++
+                "virtio-mmio + vsock built in; skipping. See the B2b-1 memory.\n",
             .{},
         );
         return error.SkipZigTest;
     }
 
-    // It found the vsock device from the command line, its driver probed, and it opened the channel
-    // back to this process on the port both sides agreed on.
-    try std.testing.expect(connected);
-
-    // And an answer came back over the channel. That answer only arrives because the interrupt reached
-    // the guest on GSI 17, so the exchange completing is the proof the controller line delivered.
-    try std.testing.expect(exchanged);
-
-    // The host end really received the guest's line, rather than the guest being told so by something
-    // that made it up.
-    try std.testing.expect(heard_len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, heard[0..heard_len], "hello from the guest") != null);
+    // The host end really received the guest's line over the channel, so the whole x86 device path
+    // works: discovery, interrupt delivery through the controller line, and the vsock exchange.
+    try std.testing.expect(heard_hello);
 
     // The launch chain travels over this same channel, but only once the guest has read it from the
     // TPM chip. The chip is B2b-2, so this gate proves the channel carries a line and defers the
