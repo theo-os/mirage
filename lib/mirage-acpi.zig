@@ -16,6 +16,8 @@ pub const sleep_port: u16 = 0x600;
 pub const Options = struct {
     /// Physical address of the DSDT; zero until Task 4 supplies one.
     dsdt_phys: u64 = 0,
+    /// How many Processor Local APIC entries the MADT carries.
+    cpus: u32 = 1,
 };
 
 /// The result of building the table set: the bytes to copy into guest RAM and
@@ -47,6 +49,73 @@ const sleep_status_off: usize = 256;
 
 // Bit 20 of the FADT flags field: hardware-reduced ACPI platform.
 const flag_hw_reduced: u32 = 1 << 20;
+
+// MADT fixed header that follows the 36-byte SDT header: local APIC address
+// and the multiple-APIC flags word. Eight bytes total.
+const MadtHeader = extern struct {
+    local_apic_address: u32,
+    flags: u32,
+};
+
+// Type 0x00 interrupt-controller entry: Processor Local APIC. Eight bytes.
+const LocalApicEntry = extern struct {
+    type: u8,
+    length: u8,
+    acpi_processor_id: u8,
+    apic_id: u8,
+    flags: u32 align(1),
+};
+
+// Type 0x01 interrupt-controller entry: I/O APIC. Twelve bytes.
+const IoApicEntry = extern struct {
+    type: u8,
+    length: u8,
+    ioapic_id: u8,
+    reserved: u8,
+    address: u32 align(1),
+    global_system_interrupt_base: u32 align(1),
+};
+
+comptime {
+    std.debug.assert(@sizeOf(MadtHeader) == 8);
+    std.debug.assert(@sizeOf(LocalApicEntry) == 8);
+    std.debug.assert(@sizeOf(IoApicEntry) == 12);
+}
+
+/// Build the MADT body (everything after the 36-byte SDT header) into `dst`.
+/// `dst` must be exactly `madtBodyLen(cpus)` bytes.
+fn writeMadtBody(dst: []u8, cpus: u32) void {
+    // Fixed header: local APIC address and flags (bit 0 = PCAT_COMPAT).
+    std.mem.writeInt(u32, dst[0..4], 0xfee00000, .little);
+    std.mem.writeInt(u32, dst[4..8], 1, .little); // PCAT_COMPAT
+
+    var off: usize = @sizeOf(MadtHeader);
+
+    // One Processor Local APIC entry per cpu.
+    var i: u32 = 0;
+    while (i < cpus) : (i += 1) {
+        const id: u8 = @intCast(i);
+        dst[off + 0] = 0; // type: Processor Local APIC
+        dst[off + 1] = @sizeOf(LocalApicEntry);
+        dst[off + 2] = id; // acpi_processor_id
+        dst[off + 3] = id; // apic_id
+        std.mem.writeInt(u32, dst[off + 4 ..][0..4], 1, .little); // enabled
+        off += @sizeOf(LocalApicEntry);
+    }
+
+    // One I/O APIC entry.
+    dst[off + 0] = 1; // type: I/O APIC
+    dst[off + 1] = @sizeOf(IoApicEntry);
+    dst[off + 2] = 0; // ioapic_id
+    dst[off + 3] = 0; // reserved
+    std.mem.writeInt(u32, dst[off + 4 ..][0..4], 0xfec00000, .little);
+    std.mem.writeInt(u32, dst[off + 8 ..][0..4], 0, .little); // gsi_base
+}
+
+/// Number of bytes in the MADT body for the given cpu count.
+fn madtBodyLen(cpus: u32) usize {
+    return @sizeOf(MadtHeader) + cpus * @sizeOf(LocalApicEntry) + @sizeOf(IoApicEntry);
+}
 
 /// Write a 12-byte GAS into `dst` at `off`. address_space=1 (SystemIO),
 /// bit_width=8, bit_offset=0, access_size=1 (byte), address=port.
@@ -100,10 +169,51 @@ pub fn build(buf: []u8, base_phys: u64, opts: Options) !Built {
     fadt_bytes[9] = almanac.checksum.compute(&fadt_bytes);
 
     const fadt_phys = try b.addRaw(&fadt_bytes);
-    const xsdt_phys = try b.xsdt(&.{fadt_phys});
+
+    // Build the MADT body into a stack buffer sized for the cpu count.
+    // The buffer size has an upper bound; callers with more cpus than the
+    // stack allows will see a compile-time or runtime assert here.
+    const madt_max_cpus: u32 = 256;
+    const madt_max_body = @sizeOf(MadtHeader) + madt_max_cpus * @sizeOf(LocalApicEntry) + @sizeOf(IoApicEntry);
+    var madt_body_buf = [_]u8{0} ** madt_max_body;
+    const madt_body = madt_body_buf[0..madtBodyLen(opts.cpus)];
+    writeMadtBody(madt_body, opts.cpus);
+    const madt_phys = try b.addTable("APIC", madt_body, 4);
+
+    const xsdt_phys = try b.xsdt(&.{ fadt_phys, madt_phys });
     const rsdp = try b.rsdp(xsdt_phys);
 
     return .{ .bytes = b.finish(), .rsdp = rsdp };
+}
+
+test "the madt describes the cpu and the ioapic" {
+    var buf: [4096]u8 align(16) = undefined;
+    const base: u64 = 0x80000;
+    const built = try build(&buf, base, .{ .cpus = 1 });
+    const Tables = almanac.TablesGeneric(almanac.OffsetMapper);
+    const offset: u64 = @intFromPtr(&buf) -% base;
+    const tabs = try Tables.init(.{ .offset = offset }, built.rsdp);
+    const madt = (try tabs.findAs(almanac.Madt)).?;
+
+    try testing.expectEqual(@as(u32, 0xfee00000), madt.localApicAddress());
+
+    var local_apic_count: u32 = 0;
+    var io_apic_count: u32 = 0;
+    var io_apic_address: u32 = 0;
+    var it = madt.iterator();
+    while (try it.next()) |entry| {
+        switch (entry) {
+            .local_apic => local_apic_count += 1,
+            .io_apic => |ia| {
+                io_apic_count += 1;
+                io_apic_address = ia.address;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(local_apic_count >= 1);
+    try testing.expectEqual(@as(u32, 1), io_apic_count);
+    try testing.expectEqual(@as(u32, 0xfec00000), io_apic_address);
 }
 
 test "the acpi set has a hw-reduced fadt discoverable from the rsdp" {
