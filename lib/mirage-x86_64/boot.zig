@@ -155,6 +155,19 @@ comptime {
     std.debug.assert(acpi_base >= 0x34000);
 }
 
+/// Fixed GPA for the TPM measurement log. Placed above the ACPI window.
+/// Does not overlap:
+///   boot_params/pagetables  0x10000-0x33fff
+///   acpi                    0x80000-0x81000
+///   low-RAM top             0x9fc00
+pub const log_base: u64 = 0x90000;
+/// Maximum log size in bytes. Bounds the stack buffer in prepare.
+pub const log_max: usize = 0x2000;
+comptime {
+    std.debug.assert(log_base >= 0x81000);
+    std.debug.assert(log_base + log_max <= 0x9fc00);
+}
+
 // The Linux zero page carries `acpi_rsdp_addr` (u64) at offset 0x070.
 const acpi_rsdp_addr_offset: u64 = 0x070;
 // Pin this offset so a layout change is caught at compile time.
@@ -186,13 +199,14 @@ const low_ram_top: u64 = 0x9fc00;
 const isa_hole_top: u64 = 0x100000;
 
 /// Write one e820 entry at the next slot and advance the index. Each entry is 20 packed bytes:
-/// an eight byte address, an eight byte length, and a four byte type, which is always usable here.
-fn writeE820(memory: *GuestMemory, boot_params: u64, index: *usize, base: u64, length: u64) Error!void {
+/// an eight byte address, an eight byte length, and a four byte type.
+/// kind 1 = usable RAM, kind 2 = reserved.
+fn writeE820(memory: *GuestMemory, boot_params: u64, index: *usize, base: u64, length: u64, kind: u32) Error!void {
     if (index.* >= max_e820_entries) return error.TooManyRegions;
     var buf: [20]u8 = undefined;
     std.mem.writeInt(u64, buf[0..8], base, .little);
     std.mem.writeInt(u64, buf[8..16], length, .little);
-    std.mem.writeInt(u32, buf[16..20], 1, .little); // type 1: usable RAM
+    std.mem.writeInt(u32, buf[16..20], kind, .little);
     try memory.write(boot_params + 0x2d0 + index.* * 20, &buf);
     index.* += 1;
 }
@@ -215,6 +229,7 @@ pub fn buildBootParams(
     low: LowLayout,
     cpus: u32,
     virtio: []const acpi.VirtioDevice,
+    tpm: ?acpi.Tpm,
 ) Error!void {
     // Reject a cmdline that would not fit in its reserved region.
     const cmdline_room = low.pml4 - low.cmdline;
@@ -233,7 +248,7 @@ pub fn buildBootParams(
     // the kernel finds it without scanning for the "RSD PTR " signature.
     {
         var acpi_buf: [4096]u8 align(16) = undefined;
-        const built = try acpi.build(&acpi_buf, acpi_base, .{ .cpus = cpus, .virtio = virtio });
+        const built = try acpi.build(&acpi_buf, acpi_base, .{ .cpus = cpus, .virtio = virtio, .tpm = tpm });
         std.debug.assert(acpi_base + built.bytes.len <= 0x9fc00);
         try memory.write(acpi_base, built.bytes);
         var rsdp_buf: [8]u8 = undefined;
@@ -275,14 +290,21 @@ pub fn buildBootParams(
         const start = region.gpa;
         const stop = region.gpa + region.len;
         if (start < low_ram_top and stop > isa_hole_top) {
-            try writeE820(memory, low.boot_params, &i, start, low_ram_top - start);
+            try writeE820(memory, low.boot_params, &i, start, low_ram_top - start, 1);
             count += 1;
-            try writeE820(memory, low.boot_params, &i, isa_hole_top, stop - isa_hole_top);
+            try writeE820(memory, low.boot_params, &i, isa_hole_top, stop - isa_hole_top, 1);
             count += 1;
         } else {
-            try writeE820(memory, low.boot_params, &i, start, region.len);
+            try writeE820(memory, low.boot_params, &i, start, region.len, 1);
             count += 1;
         }
+    }
+
+    // A reserved entry for the measurement log, so the kernel does not reclaim it.
+    // The log region may overlap a usable entry; reserved wins in the kernel's map resolution.
+    if (tpm) |t| {
+        try writeE820(memory, low.boot_params, &i, t.log_addr, t.log_len, 2);
+        count += 1;
     }
 
     // The entry count lives at its own offset, apart from the entries themselves.
@@ -326,7 +348,7 @@ test "boot_params carries the e820 map, cmdline pointer, and header" {
     header.version = 0x020c;
     // boot_flag at rel offset 0x0d (abs 0x1fe): set it so the copy preserves it
     header.boot_flag = 0xaa55;
-    try buildBootParams(&memory, header, "console=ttyS0", null, default_low, 1, &.{});
+    try buildBootParams(&memory, header, "console=ttyS0", null, default_low, 1, &.{}, null);
 
     // The copied header carries boot_flag 0xaa55 at zero-page offset 0x1fe.
     var flag_buf: [2]u8 = undefined;
@@ -363,7 +385,7 @@ test "a cmdline longer than its region is refused" {
     const too_long = try testing.allocator().alloc(u8, 0x10000);
     defer testing.allocator().free(too_long);
     @memset(too_long, 'x');
-    try testing.expectError(error.CmdlineTooLong, buildBootParams(&memory, header, too_long, null, default_low, 1, &.{}));
+    try testing.expectError(error.CmdlineTooLong, buildBootParams(&memory, header, too_long, null, default_low, 1, &.{}, null));
 }
 
 test "more than 128 regions is refused" {
@@ -378,7 +400,7 @@ test "more than 128 regions is refused" {
     var header: SetupHeader = std.mem.zeroes(SetupHeader);
     header.version = 0x020c;
 
-    try testing.expectError(error.TooManyRegions, buildBootParams(&memory, header, "x", null, default_low, 1, &.{}));
+    try testing.expectError(error.TooManyRegions, buildBootParams(&memory, header, "x", null, default_low, 1, &.{}, null));
 }
 
 test "an initramfs is placed in guest ram and recorded in boot_params" {
@@ -390,7 +412,7 @@ test "an initramfs is placed in guest ram and recorded in boot_params" {
     var header: SetupHeader = std.mem.zeroes(SetupHeader);
     header.version = 0x020c;
     const initrd = "INITRAMFSBYTES";
-    try buildBootParams(&memory, header, "console=ttyS0", initrd, default_low, 1, &.{});
+    try buildBootParams(&memory, header, "console=ttyS0", initrd, default_low, 1, &.{}, null);
     // ramdisk_image/ramdisk_size recorded
     var img: [4]u8 = undefined;
     try memory.read(default_low.boot_params + 0x218, &img);
@@ -414,7 +436,7 @@ test "an initramfs past guest ram is refused" {
     var header: SetupHeader = std.mem.zeroes(SetupHeader);
     header.version = 0x020c;
     const initrd = "INITRAMFSBYTES";
-    try testing.expectError(error.InitrdTooLarge, buildBootParams(&memory, header, "console=ttyS0", initrd, default_low, 1, &.{}));
+    try testing.expectError(error.InitrdTooLarge, buildBootParams(&memory, header, "console=ttyS0", initrd, default_low, 1, &.{}, null));
 }
 
 /// GDT selectors matching the descriptors written by buildLongMode.
@@ -649,25 +671,72 @@ pub fn prepare(
         initrd_range = .{ .start = initrd_base, .end = initrd_base + bytes.len };
     }
 
+    // Build the measuring tag list once. Both Log.sizeFor and the manifest.add loop use it,
+    // so size and contents cannot drift apart.
+    var tag_buf: [6]Manifest.Tag = undefined;
+    var tag_count: usize = 0;
+    tag_buf[tag_count] = .kernel;
+    tag_count += 1;
+    if (config.initrd != null) {
+        tag_buf[tag_count] = .initrd;
+        tag_count += 1;
+    }
+    if (config.rng_seed != null) {
+        tag_buf[tag_count] = .device_config;
+        tag_count += 1;
+    }
+    if (config.rootfs_verity != null) {
+        tag_buf[tag_count] = .rootfs_verity;
+        tag_count += 1;
+    }
+    tag_buf[tag_count] = .cmdline;
+    tag_count += 1;
+    const measuring = tag_buf[0..tag_count];
+
+    var log_region: ?Range = null;
+    var tpm_desc: ?acpi.Tpm = null;
+    if (config.tpm) {
+        const log_len = attest.Log.sizeFor(measuring);
+        std.debug.assert(log_len <= log_max);
+        log_region = .{ .start = log_base, .end = log_base + log_len };
+        tpm_desc = .{
+            .control = 0xfed4_0000,
+            .log_addr = log_base,
+            .log_len = @intCast(log_len),
+        };
+    }
+
     var virtio_buf: [4]acpi.VirtioDevice = undefined;
     const virtio = virtioDevicesFromConfig(config, &virtio_buf);
-    try buildBootParams(memory, parsed.header, config.cmdline, config.initrd, low, config.cpus, virtio);
+    try buildBootParams(memory, parsed.header, config.cmdline, config.initrd, low, config.cpus, virtio, tpm_desc);
     try buildLongMode(memory, low, config.ram_size);
     try memory.write(kernel_base, protected);
 
-    // The kernel and the command line are measured. x86 has no device tree to measure, and the rest
-    // of the launch inputs reach the guest through the zero page the command line names.
-    try manifest.add(gpa, .kernel, config.kernel);
-    if (config.initrd) |bytes| try manifest.add(gpa, .initrd, bytes);
-    if (config.rng_seed) |bytes| try manifest.add(gpa, .device_config, bytes);
-    if (config.rootfs_verity) |bytes| try manifest.add(gpa, .rootfs_verity, bytes);
-    try manifest.add(gpa, .cmdline, config.cmdline);
+    for (measuring) |tag| try manifest.add(gpa, tag, switch (tag) {
+        .kernel => config.kernel,
+        .initrd => config.initrd.?,
+        .device_config => config.rng_seed.?,
+        .rootfs_verity => config.rootfs_verity.?,
+        .cmdline => config.cmdline,
+        else => unreachable,
+    });
     manifest.seal();
+
+    // Write the log bytes last, because the log holds the measurement of every entry above.
+    if (log_region) |where| {
+        const log_len = where.end - where.start;
+        const log_buf = try gpa.alloc(u8, log_len);
+        defer gpa.free(log_buf);
+        const written = attest.Log.write(log_buf, manifest, 0);
+        std.debug.assert(written.len == log_len);
+        try memory.write(where.start, written);
+    }
 
     return .{
         .entry = kernel_base + parsed.entry_offset,
         .device_tree = low.boot_params,
         .initrd = initrd_range,
+        .log = log_region,
     };
 }
 
@@ -722,7 +791,7 @@ test "boot_params records the acpi rsdp address" {
     var memory: GuestMemory = .{ .regions = &regions };
     var header: SetupHeader = std.mem.zeroes(SetupHeader);
     header.version = 0x020c;
-    try buildBootParams(&memory, header, "console=ttyS0", null, default_low, 1, &.{});
+    try buildBootParams(&memory, header, "console=ttyS0", null, default_low, 1, &.{}, null);
 
     // Read the 8-byte acpi_rsdp_addr at zero-page offset 0x070.
     var rsdp_buf: [8]u8 = undefined;
@@ -747,7 +816,7 @@ test "boot params build a dsdt with the given virtio device" {
     header.version = 0x020c;
 
     // Build with no devices; record the DSDT body length.
-    try buildBootParams(&memory, header, "console=ttyS0", null, default_low, 1, &.{});
+    try buildBootParams(&memory, header, "console=ttyS0", null, default_low, 1, &.{}, null);
     var rsdp_buf: [8]u8 = undefined;
     try memory.read(default_low.boot_params + acpi_rsdp_addr_offset, &rsdp_buf);
     const rsdp_empty = std.mem.readInt(u64, &rsdp_buf, .little);
@@ -762,7 +831,7 @@ test "boot params build a dsdt with the given virtio device" {
     // Build with one virtio device; the DSDT must be longer.
     @memset(backing, 0);
     const dev = acpi.VirtioDevice{ .addr = 0xd0000200, .size = 0x200, .gsi = 17 };
-    try buildBootParams(&memory, header, "console=ttyS0", null, default_low, 1, &.{dev});
+    try buildBootParams(&memory, header, "console=ttyS0", null, default_low, 1, &.{dev}, null);
     try memory.read(default_low.boot_params + acpi_rsdp_addr_offset, &rsdp_buf);
     const rsdp_dev = std.mem.readInt(u64, &rsdp_buf, .little);
     const tabs_dev = try Tables.init(.{ .offset = offset }, rsdp_dev);
@@ -827,4 +896,133 @@ test "the x86 acpi device list follows the device flags" {
         .block_device = false,
     }, &buf2);
     try testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "x86 boot reserves a measurement log and names it in the tpm2 table" {
+    const gpa = testing.allocator();
+    const ram_base = 0;
+    const backing = try gpa.alloc(u8, 0x40_0000);
+    defer gpa.free(backing);
+    @memset(backing, 0);
+    var regions = [_]GuestMemory.Region{.{ .gpa = ram_base, .len = backing.len, .backing = .{ .shared = backing } }};
+    var memory: GuestMemory = .{ .regions = &regions };
+
+    // Minimal valid bzImage header.
+    var img = [_]u8{0} ** 4096;
+    img[0x1f1] = 4;
+    std.mem.writeInt(u16, img[0x1fe..][0..2], 0xaa55, .little);
+    std.mem.writeInt(u32, img[0x202..][0..4], 0x53726448, .little);
+    std.mem.writeInt(u16, img[0x206..][0..2], 0x020c, .little);
+    std.mem.writeInt(u16, img[0x236..][0..2], 0x1, .little);
+
+    var manifest: Manifest = .{};
+    defer manifest.deinit(gpa);
+
+    const layout = try prepare(gpa, &memory, &manifest, .{
+        .kernel = &img,
+        .cmdline = "console=ttyS0",
+        .ram_base = ram_base,
+        .ram_size = backing.len,
+        .cpus = 1,
+        .uart_base = 0x3f8,
+        .tpm = true,
+        .block_device = false,
+    });
+
+    // The measuring tags for this config are kernel + cmdline (no initrd/rng/verity).
+    const Tags = Manifest.Tag;
+    const expected_tags = [_]Tags{ .kernel, .cmdline };
+    const expected_log_len = attest.Log.sizeFor(&expected_tags);
+
+    // layout.log must point at log_base with the right length.
+    try testing.expectEqual(@as(?Range, .{ .start = log_base, .end = log_base + expected_log_len }), layout.log);
+
+    // Read the RSDP from the zero page and find the TPM2 table.
+    const offset: u64 = @intFromPtr(backing.ptr) -% ram_base;
+    var rsdp_buf: [8]u8 = undefined;
+    try memory.read(default_low.boot_params + acpi_rsdp_addr_offset, &rsdp_buf);
+    const rsdp_addr = std.mem.readInt(u64, &rsdp_buf, .little);
+
+    const Tables = @import("almanac").TablesGeneric(@import("almanac").OffsetMapper);
+    const tabs = try Tables.init(.{ .offset = offset }, rsdp_addr);
+    const tpm2 = (try tabs.findAs(@import("almanac").Tpm2)).?;
+
+    // The TPM2 table must name log_base and the correct log length.
+    try testing.expectEqual(@as(?u64, log_base), tpm2.logAreaStart());
+    try testing.expectEqual(@as(?u32, @intCast(expected_log_len)), tpm2.logAreaLength());
+    try testing.expectEqual(@as(u64, 0xfed4_0000), tpm2.controlAddress());
+
+    // An e820 entry of type 2 (reserved) must cover [log_base, log_base+log_len).
+    var n_buf: [1]u8 = undefined;
+    try memory.read(default_low.boot_params + 0x1e8, &n_buf);
+    const n_entries = n_buf[0];
+    var found_reserved = false;
+    var ei: usize = 0;
+    while (ei < n_entries) : (ei += 1) {
+        var e_base_buf: [8]u8 = undefined;
+        var e_len_buf: [8]u8 = undefined;
+        var e_type_buf: [4]u8 = undefined;
+        try memory.read(default_low.boot_params + 0x2d0 + ei * 20, &e_base_buf);
+        try memory.read(default_low.boot_params + 0x2d0 + ei * 20 + 8, &e_len_buf);
+        try memory.read(default_low.boot_params + 0x2d0 + ei * 20 + 16, &e_type_buf);
+        const e_base = std.mem.readInt(u64, &e_base_buf, .little);
+        const e_len = std.mem.readInt(u64, &e_len_buf, .little);
+        const e_type = std.mem.readInt(u32, &e_type_buf, .little);
+        if (e_type == 2 and e_base == log_base and e_len == expected_log_len) {
+            found_reserved = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_reserved);
+
+    // The log bytes at log_base must equal what Log.write produces for this manifest.
+    const log_buf = try gpa.alloc(u8, expected_log_len);
+    defer gpa.free(log_buf);
+    const written = attest.Log.write(log_buf, &manifest, 0);
+    const guest_log = try gpa.alloc(u8, expected_log_len);
+    defer gpa.free(guest_log);
+    try memory.read(log_base, guest_log);
+    try testing.expectEqualSlices(u8, written, guest_log);
+}
+
+test "x86 boot with tpm=false produces no tpm2 table and null log" {
+    const gpa = testing.allocator();
+    const ram_base = 0;
+    const backing = try gpa.alloc(u8, 0x40_0000);
+    defer gpa.free(backing);
+    @memset(backing, 0);
+    var regions = [_]GuestMemory.Region{.{ .gpa = ram_base, .len = backing.len, .backing = .{ .shared = backing } }};
+    var memory: GuestMemory = .{ .regions = &regions };
+
+    var img = [_]u8{0} ** 4096;
+    img[0x1f1] = 4;
+    std.mem.writeInt(u16, img[0x1fe..][0..2], 0xaa55, .little);
+    std.mem.writeInt(u32, img[0x202..][0..4], 0x53726448, .little);
+    std.mem.writeInt(u16, img[0x206..][0..2], 0x020c, .little);
+    std.mem.writeInt(u16, img[0x236..][0..2], 0x1, .little);
+
+    var manifest: Manifest = .{};
+    defer manifest.deinit(gpa);
+
+    const layout = try prepare(gpa, &memory, &manifest, .{
+        .kernel = &img,
+        .cmdline = "console=ttyS0",
+        .ram_base = ram_base,
+        .ram_size = backing.len,
+        .cpus = 1,
+        .uart_base = 0x3f8,
+        .tpm = false,
+        .block_device = false,
+    });
+
+    try testing.expectEqual(@as(?Range, null), layout.log);
+
+    const offset: u64 = @intFromPtr(backing.ptr) -% ram_base;
+    var rsdp_buf: [8]u8 = undefined;
+    try memory.read(default_low.boot_params + acpi_rsdp_addr_offset, &rsdp_buf);
+    const rsdp_addr = std.mem.readInt(u64, &rsdp_buf, .little);
+
+    const Tables = @import("almanac").TablesGeneric(@import("almanac").OffsetMapper);
+    const tabs = try Tables.init(.{ .offset = offset }, rsdp_addr);
+    try testing.expectEqual(@as(?@import("almanac").Tpm2, null), try tabs.findAs(@import("almanac").Tpm2));
 }
