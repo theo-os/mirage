@@ -56,7 +56,7 @@ pub fn build(b: *std.Build) void {
 
     const attest = add.lib("mirage-attest", &.{});
     const memory = add.lib("mirage-memory", &.{});
-    _ = add.lib("mirage-acpi", &.{
+    const acpi = add.lib("mirage-acpi", &.{
         .{ .name = "almanac", .module = almanac },
         .{ .name = "mirage-memory", .module = memory },
     });
@@ -74,6 +74,8 @@ pub fn build(b: *std.Build) void {
     const x86_64 = add.lib("mirage-x86_64", &.{
         .{ .name = "mirage-memory", .module = memory },
         .{ .name = "mirage-attest", .module = attest },
+        .{ .name = "mirage-acpi", .module = acpi },
+        .{ .name = "almanac", .module = almanac },
     });
     // One architecture, chosen by the target, exposed under the one name the backend and
     // the core name. The concrete modules stay available where a file names an arch.

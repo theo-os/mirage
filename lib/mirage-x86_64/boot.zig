@@ -11,8 +11,9 @@ const testing = @import("mirage-testing");
 const GuestMemory = @import("mirage-memory").GuestMemory;
 const attest = @import("mirage-attest");
 const Manifest = attest.Manifest;
+const acpi = @import("mirage-acpi");
 
-pub const Error = error{ TooSmall, NotABzImage, UnsupportedProtocol, No64BitEntry, CmdlineTooLong, TooManyRegions, InitrdTooLarge } || GuestMemory.Error;
+pub const Error = error{ TooSmall, NotABzImage, UnsupportedProtocol, No64BitEntry, CmdlineTooLong, TooManyRegions, InitrdTooLarge, OutOfSpace } || GuestMemory.Error;
 
 /// The fields the boot path needs, laid out exactly as the spec places them
 /// starting at file offset 0x1f1.  Offsets in comments are relative to 0x1f1.
@@ -137,6 +138,29 @@ pub const default_low: LowLayout = .{
     .gdt = 0x33000,
 };
 
+/// Fixed GPA for the ACPI table set. Sits in the 512 KiB window
+/// 0x80000-0x9fc00 (conventional low RAM, below the BIOS area at 0x9fc00).
+/// Does not overlap:
+///   boot_params/cmdline/pagetables  0x10000-0x33fff
+///   kernel                          0x100000+
+///   initrd                          0x1000_0000+
+/// A 4 KiB buffer is more than enough for the RSDP+XSDT+FADT set.
+pub const acpi_base: u64 = 0x80000;
+// Bound check: acpi_base must sit below the low-RAM top (0x9fc00).
+comptime {
+    std.debug.assert(acpi_base < 0x9fc00);
+    std.debug.assert(acpi_base + 4096 <= 0x9fc00);
+    // Must not overlap the structures below.
+    std.debug.assert(acpi_base >= 0x34000);
+}
+
+// The Linux zero page carries `acpi_rsdp_addr` (u64) at offset 0x070.
+// Pin this offset so a layout change is caught at compile time.
+comptime {
+    std.debug.assert(acpi_rsdp_addr_offset == 0x070);
+}
+const acpi_rsdp_addr_offset: u64 = 0x070;
+
 /// Fixed GPA where the initrd is placed. The kernel loads at the one megabyte mark and relocates and
 /// decompresses itself into the memory above, a working set that reaches tens of megabytes for a real
 /// kernel. 256 MiB clears all of it, so the archive is still whole when the kernel unpacks it as its
@@ -198,6 +222,18 @@ pub fn buildBootParams(
     try memory.write(low.cmdline, cmdline);
     const nul = [1]u8{0};
     try memory.write(low.cmdline + cmdline.len, &nul);
+
+    // Build the ACPI table set and copy it to acpi_base in guest RAM.
+    // The RSDP address is then recorded in the zero page at offset 0x070 so
+    // the kernel finds it without scanning for the "RSD PTR " signature.
+    {
+        var acpi_buf: [4096]u8 align(16) = undefined;
+        const acpi_bytes = try acpi.build(&acpi_buf, acpi_base, .{});
+        try memory.write(acpi_base, acpi_bytes);
+        var rsdp_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &rsdp_buf, acpi.rsdp_phys(acpi_base), .little);
+        try memory.write(low.boot_params + acpi_rsdp_addr_offset, &rsdp_buf);
+    }
 
     // Copy the setup header into the zero page at offset 0x1f1.
     var hdr_copy = header;
@@ -641,4 +677,22 @@ test "a launch places the protected mode kernel and names the zero page" {
     try std.testing.expect(manifest.sealed);
     try testing.expectEqual(Manifest.Tag.kernel, manifest.entries.items[0].tag);
     try testing.expectEqual(Manifest.Tag.cmdline, manifest.entries.items[1].tag);
+}
+
+test "boot_params records the acpi rsdp address" {
+    const gpa = testing.allocator();
+    const backing = try gpa.alloc(u8, 0x200000);
+    defer gpa.free(backing);
+    @memset(backing, 0);
+    var regions = [_]GuestMemory.Region{.{ .gpa = 0, .len = 0x200000, .backing = .{ .shared = backing } }};
+    var memory: GuestMemory = .{ .regions = &regions };
+    var header: SetupHeader = std.mem.zeroes(SetupHeader);
+    header.version = 0x020c;
+    try buildBootParams(&memory, header, "console=ttyS0", null, default_low);
+
+    // Read the 8-byte acpi_rsdp_addr at zero-page offset 0x070.
+    var rsdp_buf: [8]u8 = undefined;
+    try memory.read(default_low.boot_params + acpi_rsdp_addr_offset, &rsdp_buf);
+    const recorded = std.mem.readInt(u64, &rsdp_buf, .little);
+    try testing.expectEqual(acpi.rsdp_phys(acpi_base), recorded);
 }
