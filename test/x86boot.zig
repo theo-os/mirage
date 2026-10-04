@@ -57,6 +57,11 @@ const net_intid = 19;
 /// The addresses the NAT invents for the guest and its gateway. The guest-init holds the guest side.
 const guest_mac = [6]u8{ 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
 
+/// The balloon device slot. The guest's balloon driver hands pages to the device to reach the target
+/// this gate sets; the gate takes those pages back. Pages handed over are proof a real driver drove it.
+const balloon_addr = 0xd000_0400;
+const balloon_intid = 18;
+
 /// The address the guest answers to, and the port both sides agreed on. The guest-init holds the
 /// same two numbers, and a channel where one side disagrees is a channel nobody answers.
 const guest_cid = 3;
@@ -862,4 +867,129 @@ test "an x86 guest reaches a network through the vmm nat" {
     try std.testing.expect(frames_out >= 1);
     try std.testing.expect(frames_in >= 1);
     try std.testing.expect(sent_ip);
+}
+
+test "an x86 guest hands memory back through a balloon" {
+    if (@import("builtin").cpu.arch != .x86_64) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+
+    const kernel = (try mapKernel()) orelse return error.SkipZigTest;
+    defer std.posix.munmap(kernel);
+
+    var machine = backend.kvm.Machine.create(gpa, 1) catch |err| switch (err) {
+        error.NoKvm => return error.SkipZigTest,
+        else => return err,
+    };
+    defer machine.deinit();
+
+    const region = try machine.vm.addMemory(ram_base, ram_size, .shared);
+    var regions = [_]GuestMemory.Region{region};
+    var memory: GuestMemory = .{ .regions = &regions };
+
+    const hv = machine.backend();
+    const id = try hv.addVcpu();
+
+    var controller = try backend.platform.createController(&machine.vm, 1);
+    defer controller.deinit();
+    const line = backend.platform.controllerLine(&controller);
+
+    var manifest: Manifest = .{};
+    defer manifest.deinit(gpa);
+
+    var archive: image.Cpio = .init(gpa);
+    defer archive.deinit();
+    try archive.addDirectory("dev", 0o755);
+    try archive.addCharacterDevice("dev/console", 0o600, 5, 1);
+    try archive.addFile("init", 0o755, guest_init);
+    const initrd = try archive.finish();
+    defer gpa.free(initrd);
+
+    var balloon: device.virtio.Balloon = undefined;
+    balloon.init(ram_base, ram_size);
+    // Half of what the guest was told it has: a target the driver can plainly reach, so a guest that
+    // hands over nothing has a driver that never looked rather than one that tried and could not.
+    balloon.setTarget(ram_size / 2 / device.virtio.Balloon.page_size);
+
+    const layout = try core.Launch.prepare(gpa, &memory, &manifest, .{
+        .kernel = kernel,
+        .initrd = initrd,
+        .cmdline = "console=ttyS0 earlyprintk=serial,ttyS0 panic=-1 rdinit=/init",
+        .ram_base = ram_base,
+        .ram_size = ram_size,
+        .cpus = 1,
+        .uart_base = serial_port,
+        // The one declared virtio device is the balloon at platform.balloon (gsi 18).
+        .balloon = true,
+        .block_device = false,
+    });
+
+    const output = try gpa.alloc(u8, 256 << 10);
+    defer gpa.free(output);
+    var sink = std.Io.Writer.fixed(output);
+    var serial: device.Uart16550 = .{ .sink = &sink };
+    var acpi_shutdown: device.AcpiShutdown = .{ .slp_typ = acpi.s5_slp_typ };
+
+    var port_devices = [_]device.Bus.Device{ serial.device(serial_port), acpi_shutdown.device(acpi.sleep_port) };
+    var ports: device.Bus = .{ .devices = &port_devices };
+    var mmio_devices = [_]device.Bus.Device{balloon.device(balloon_addr)};
+    var bus: device.Bus = .{ .devices = &mmio_devices };
+
+    var services = [_]device.Service{ serial.service(serial_irq), balloon.service(balloon_intid) };
+
+    try arch.boot.enter(&machine.vcpus[id], layout);
+
+    const deadline = nowMs() + 20_000;
+    armTicks(10);
+
+    var exits: usize = 0;
+    var handed_over: u64 = 0;
+    while (exits < max_exits) : (exits += 1) {
+        if (exits % 1024 == 0 and nowMs() > deadline) {
+            std.debug.print("\n=== deadline after {d} exits ===\n", .{exits});
+            break;
+        }
+
+        const exit = hv.run(id) catch |err| {
+            std.debug.print("\nrun failed after {d} exits: {t}, kvm said {?}\n", .{ exits, err, machine.fault });
+            break;
+        };
+
+        switch (exit) {
+            .port_out => |w| ports.write(w.port, w.size, w.value),
+            .port_in => |r| try hv.completeMmioRead(id, ports.read(r.port, r.size)),
+            .mmio_write => |w| bus.write(w.gpa, w.size, w.value),
+            .mmio_read => |r| try hv.completeMmioRead(id, bus.read(r.gpa, r.size)),
+            .interrupted => {},
+            else => break,
+        }
+
+        // Take the pages the guest has handed over, so the device does not back-pressure and stall.
+        var ranges: [64]device.virtio.Balloon.Range = undefined;
+        while (true) {
+            const got = balloon.take(&ranges);
+            if (got == 0) break;
+            for (ranges[0..got]) |range| handed_over += range.len;
+        }
+
+        try core.Launch.poll(services[0..services.len], &memory, line);
+
+        if (acpi_shutdown.requested) break;
+
+        if (sink.buffered().len + 512 > output.len) break;
+    }
+
+    if (handed_over == 0) {
+        std.debug.print(
+            "\nnote: the guest handed over no memory. This gate needs -Dkernel= a kernel with " ++
+                "virtio-mmio + virtio-balloon built in; skipping. See the B2b-2a memory.\n",
+            .{},
+        );
+        return error.SkipZigTest;
+    }
+
+    // The guest's balloon driver handed real memory back toward the target, over many rounds whose
+    // completions it only saw over the interrupt line. A quarter of RAM is far past a single batch,
+    // so reaching it is proof a real driver drove the device, not a fixture.
+    try std.testing.expect(handed_over >= ram_size / 4);
 }

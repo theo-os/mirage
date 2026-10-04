@@ -434,6 +434,17 @@ pub fn build(b: *std.Build) void {
         b.step("test-x86net", "Boot a real x86 kernel and exchange network frames through the vmm nat under KVM")
             .dependOn(&b.addRunArtifact(x86net_tests).step);
 
+        // The x86 balloon gate: the guest's balloon driver hands pages back to reach the target the
+        // gate sets. Needs `-Dkernel=` a kernel with virtio-mmio + virtio-balloon built in; skips
+        // otherwise. Its own step so `zig build test` does not need an x86 kernel.
+        const x86balloon_tests = b.addTest(.{
+            .name = "x86balloon",
+            .root_module = x86boot_module,
+            .filters = &.{"hands memory back"},
+        });
+        b.step("test-x86balloon", "Boot a real x86 kernel and inflate a balloon under KVM")
+            .dependOn(&b.addRunArtifact(x86balloon_tests).step);
+
         // Stops a guest, moves it to a machine that has never run, and lets it carry on. Its own
         // target because it needs a kernel and because what it proves is separate.
         const snapshot_module = b.createModule(.{
