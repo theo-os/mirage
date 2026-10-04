@@ -458,22 +458,30 @@ pub fn enter(vcpu: anytype, layout: Layout) !void {
 ///
 /// For B1 the identity map is capped at 1 GB; a single PD (512 entries × 2 MB)
 /// covers that range, which is enough to start the kernel.
+///
+/// Under AMD SEV the hardware only encrypts a page when its page-table entry has
+/// the C-bit set. Pass the bit index from CPUID 0x8000001F EBX[5:0] (typically
+/// 51 on this EPYC) as `c_bit`. When null every written byte is identical to the
+/// non-SEV path.
 pub fn buildLongMode(
     memory: *GuestMemory,
     low: LowLayout,
     map_bytes: u64,
+    c_bit: ?u6,
 ) Error!void {
+    const c_mask: u64 = if (c_bit) |b| @as(u64, 1) << b else 0;
+
     // Cap the map at 1 GB so it fits within one PD (512 × 2 MB entries).
     const cap: u64 = 0x40000000;
     const covered = @min(map_bytes, cap);
 
     // PML4[0] → PDPT, present | rw.
     var buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &buf, low.pdpt | 0x3, .little);
+    std.mem.writeInt(u64, &buf, (low.pdpt | 0x3) | c_mask, .little);
     try memory.write(low.pml4, &buf);
 
     // PDPT[0] → PD, present | rw.
-    std.mem.writeInt(u64, &buf, low.pd | 0x3, .little);
+    std.mem.writeInt(u64, &buf, (low.pd | 0x3) | c_mask, .little);
     try memory.write(low.pdpt, &buf);
 
     // PD entries: each covers 2 MB with present | rw | ps (0x83).
@@ -482,7 +490,7 @@ pub fn buildLongMode(
     const n = @min(n_pages, max_pd_entries);
     var i: u64 = 0;
     while (i < n) : (i += 1) {
-        const pde = (i * 0x200000) | 0x83;
+        const pde = ((i * 0x200000) | 0x83) | c_mask;
         std.mem.writeInt(u64, &buf, pde, .little);
         try memory.write(low.pd + i * 8, &buf);
     }
@@ -515,7 +523,7 @@ test "the page tables identity-map low memory with 2mb pages" {
     var memory: GuestMemory = .{ .regions = &regions };
     const low = default_low;
 
-    try buildLongMode(&memory, low, 0x40000000);
+    try buildLongMode(&memory, low, 0x40000000, null);
 
     // PML4[0] must be present, writable, and point at the PDPT.
     const pml4e = readU64(&memory, low.pml4 + 0);
@@ -546,7 +554,7 @@ test "the gdt has a 64-bit code and a data descriptor" {
     var memory: GuestMemory = .{ .regions = &regions };
     const low = default_low;
 
-    try buildLongMode(&memory, low, 0x200000);
+    try buildLongMode(&memory, low, 0x200000, null);
 
     // Code descriptor at GDT[1] (offset +8): L bit is bit 53, must be set.
     const code = readU64(&memory, low.gdt + 8);
@@ -555,6 +563,44 @@ test "the gdt has a 64-bit code and a data descriptor" {
     // Data descriptor at GDT[2] (offset +16): present bit (bit 47) must be set.
     const data = readU64(&memory, low.gdt + 16);
     try std.testing.expect((data >> 47) & 1 == 1);
+}
+
+test "the sev boot page tables carry the c-bit" {
+    const backing = try testing.allocator().alloc(u8, 0x40000000);
+    defer testing.allocator().free(backing);
+    @memset(backing, 0);
+    var regions = [_]GuestMemory.Region{.{ .gpa = 0, .len = 0x40000000, .backing = .{ .shared = backing } }};
+    var memory: GuestMemory = .{ .regions = &regions };
+    const low = default_low;
+    const cbit: u6 = 51;
+    const c_mask: u64 = @as(u64, 1) << cbit;
+
+    try buildLongMode(&memory, low, 0x40000000, cbit);
+
+    const pml4e = readU64(&memory, low.pml4 + 0);
+    try std.testing.expect(pml4e & c_mask != 0);
+    try std.testing.expect((pml4e & 0x3) == 0x3);
+
+    const pdpte = readU64(&memory, low.pdpt + 0);
+    try std.testing.expect(pdpte & c_mask != 0);
+    try std.testing.expect((pdpte & 0x3) == 0x3);
+
+    const pde0 = readU64(&memory, low.pd + 0);
+    try std.testing.expect(pde0 & c_mask != 0);
+    try std.testing.expect((pde0 & 0x83) == 0x83);
+
+    // Build with null and confirm bit 51 is clear (byte-identical non-SEV path).
+    @memset(backing, 0);
+    try buildLongMode(&memory, low, 0x40000000, null);
+
+    const pml4e_nosev = readU64(&memory, low.pml4 + 0);
+    try std.testing.expect(pml4e_nosev & c_mask == 0);
+
+    const pdpte_nosev = readU64(&memory, low.pdpt + 0);
+    try std.testing.expect(pdpte_nosev & c_mask == 0);
+
+    const pde0_nosev = readU64(&memory, low.pd + 0);
+    try std.testing.expect(pde0_nosev & c_mask == 0);
 }
 
 /// Where the protected mode kernel is placed. A relocatable bzImage is happy at the one megabyte
@@ -713,7 +759,7 @@ pub fn prepare(
     var virtio_buf: [5]acpi.VirtioDevice = undefined;
     const virtio = virtioDevicesFromConfig(config, &virtio_buf);
     try buildBootParams(memory, parsed.header, config.cmdline, config.initrd, low, config.cpus, virtio, tpm_desc);
-    try buildLongMode(memory, low, config.ram_size);
+    try buildLongMode(memory, low, config.ram_size, null);
     try memory.write(kernel_base, protected);
 
     for (measuring) |tag| try manifest.add(gpa, tag, switch (tag) {

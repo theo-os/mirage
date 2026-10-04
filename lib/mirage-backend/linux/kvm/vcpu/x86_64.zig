@@ -833,7 +833,7 @@ test "a long-mode x86 guest runs and writes a port" {
     var memory: Backend.GuestMemory = .{ .regions = &.{region} };
 
     const low = arch.boot.default_low;
-    try arch.boot.buildLongMode(&memory, low, span);
+    try arch.boot.buildLongMode(&memory, low, span, null);
 
     // mov al,0x4d ; out 0xe9,al ; jmp $ — placed inside the 2 MB page the PD identity-maps.
     const entry = 0x100000;
