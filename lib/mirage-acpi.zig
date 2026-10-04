@@ -16,12 +16,24 @@ pub const sleep_port: u16 = 0x600;
 /// (s5_slp_typ << 2) | (1 << 5) on that register.
 pub const s5_slp_typ: u8 = 5;
 
+/// A TPM device to describe in the ACPI set.
+pub const Tpm = struct {
+    /// Physical address of the TPM control area.
+    control: u64,
+    /// Physical address of the event-log area (0 = none).
+    log_addr: u64 = 0,
+    /// Length of the event-log area in bytes (0 = none).
+    log_len: u32 = 0,
+};
+
 /// Options for building the ACPI table set.
 pub const Options = struct {
     /// How many Processor Local APIC entries the MADT carries.
     cpus: u32 = 1,
     /// Virtio-mmio devices to describe as ACPI Device objects in the DSDT.
     virtio: []const VirtioDevice = &.{},
+    /// When set, a TPM2 table is emitted and listed in the XSDT.
+    tpm: ?Tpm = null,
 };
 
 /// The result of building the table set: the bytes to copy into guest RAM and
@@ -363,7 +375,22 @@ pub fn build(buf: []u8, base_phys: u64, opts: Options) !Built {
     writeMadtBody(madt_body, opts.cpus);
     const madt_phys = try b.addTable("APIC", madt_body, 4);
 
-    const xsdt_phys = try b.xsdt(&.{ fadt_phys, madt_phys });
+    // Build the XSDT entry list. Max 3: FADT, MADT, and optionally TPM2.
+    var xsdt_entries: [3]u64 = undefined;
+    var n: usize = 0;
+    xsdt_entries[n] = fadt_phys; n += 1;
+    xsdt_entries[n] = madt_phys; n += 1;
+    if (opts.tpm) |t| {
+        const tpm2_phys = try b.tpm2(.{
+            .control_address = t.control,
+            .start_method = 6,
+            .log_area_start = t.log_addr,
+            .log_area_length = t.log_len,
+        });
+        xsdt_entries[n] = tpm2_phys; n += 1;
+    }
+
+    const xsdt_phys = try b.xsdt(xsdt_entries[0..n]);
     const rsdp = try b.rsdp(xsdt_phys);
 
     return .{ .bytes = b.finish(), .rsdp = rsdp };
@@ -644,6 +671,29 @@ test "the dsdt carries a virtio-mmio device when one is given" {
     try testing.expectEqual(@as(u32, 17), r1.extended_irq.interrupts[0]);
 
     try std.testing.expect((try res_it.next()) == null);
+}
+
+test "the acpi set carries a tpm2 table when a tpm is given" {
+    var buf: [4096]u8 align(16) = undefined;
+    const base: u64 = 0x80000;
+    const Tables = almanac.TablesGeneric(almanac.OffsetMapper);
+    const offset: u64 = @intFromPtr(&buf) -% base;
+
+    // Build with a TPM. Verify the TPM2 table is present and fields match.
+    const built = try build(&buf, base, .{
+        .tpm = .{ .control = 0xfed4_0000, .log_addr = 0x90000, .log_len = 0x1000 },
+    });
+    const tabs = try Tables.init(.{ .offset = offset }, built.rsdp);
+    const tpm2 = (try tabs.findAs(almanac.Tpm2)).?;
+    try testing.expectEqual(@as(u64, 0xfed4_0000), tpm2.controlAddress());
+    try testing.expectEqual(almanac.tables.tpm2.StartMethod.tis, tpm2.startMethod());
+    try testing.expectEqual(@as(?u32, 0x1000), tpm2.logAreaLength());
+    try testing.expectEqual(@as(?u64, 0x90000), tpm2.logAreaStart());
+
+    // Build without a TPM. Verify no TPM2 table in the set.
+    const built_no_tpm = try build(&buf, base, .{});
+    const tabs_no_tpm = try Tables.init(.{ .offset = offset }, built_no_tpm.rsdp);
+    try testing.expectEqual(@as(?almanac.Tpm2, null), try tabs_no_tpm.findAs(almanac.Tpm2));
 }
 
 test {
