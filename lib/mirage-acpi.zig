@@ -170,10 +170,12 @@ pub fn build(buf: []u8, base_phys: u64, opts: Options) !Built {
 
     const fadt_phys = try b.addRaw(&fadt_bytes);
 
-    // Build the MADT body into a stack buffer sized for the cpu count.
-    // The buffer size has an upper bound; callers with more cpus than the
-    // stack allows will see a compile-time or runtime assert here.
+    // Build the MADT body into a stack buffer sized for the cpu count. The
+    // xAPIC id is one byte, so 256 is the ceiling; cpus is VMM config, so a
+    // caller past it is a programmer error, caught here before the body is
+    // sized and before the per-cpu loop narrows each id to a u8.
     const madt_max_cpus: u32 = 256;
+    std.debug.assert(opts.cpus <= madt_max_cpus);
     const madt_max_body = @sizeOf(MadtHeader) + madt_max_cpus * @sizeOf(LocalApicEntry) + @sizeOf(IoApicEntry);
     var madt_body_buf = [_]u8{0} ** madt_max_body;
     const madt_body = madt_body_buf[0..madtBodyLen(opts.cpus)];
@@ -211,7 +213,7 @@ test "the madt describes the cpu and the ioapic" {
             else => {},
         }
     }
-    try std.testing.expect(local_apic_count >= 1);
+    try testing.expectEqual(true, local_apic_count >= 1);
     try testing.expectEqual(@as(u32, 1), io_apic_count);
     try testing.expectEqual(@as(u32, 0xfec00000), io_apic_address);
 }
