@@ -398,6 +398,18 @@ pub fn build(b: *std.Build) void {
         b.step("test-x86userspace", "Boot a real x86 kernel to a guest in userspace under KVM")
             .dependOn(&b.addRunArtifact(x86userspace_tests).step);
 
+        // The x86 vsock capstone: the guest finds a virtio-mmio vsock device from the kernel command
+        // line and exchanges a line over the channel. It skips until x86 interrupt-domain integration
+        // lands (the device interrupt is not yet mapped into the guest). Needs `-Dkernel=` a kernel
+        // with virtio-mmio + vsock built in. Its own step so `zig build test` does not need one.
+        const x86vsock_tests = b.addTest(.{
+            .name = "x86vsock",
+            .root_module = x86boot_module,
+            .filters = &.{"vsock"},
+        });
+        b.step("test-x86vsock", "Boot a real x86 kernel and talk to the guest over vsock under KVM")
+            .dependOn(&b.addRunArtifact(x86vsock_tests).step);
+
         // Stops a guest, moves it to a machine that has never run, and lets it carry on. Its own
         // target because it needs a kernel and because what it proves is separate.
         const snapshot_module = b.createModule(.{
