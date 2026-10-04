@@ -163,15 +163,18 @@ pub const VirtioDevice = struct {
     gsi: u32,
 };
 
-// Fixed body lengths used in emitDevice. Comptime asserts pin them.
+// Fixed body lengths used in emitDevice.
 const mem32_body_len: usize = 9; // info(1) + base(4) + length(4)
 const extirq_body_len: usize = 6; // flags(1) + count(1) + gsi(4)
-const crs_resources_len: usize = 12 + 9 + 2; // Memory32Fixed + ExtInterrupt + EndTag
+const crs_resources_len: usize = 23; // Memory32Fixed + ExtInterrupt + EndTag
 
 comptime {
-    std.debug.assert(mem32_body_len == 9);
-    std.debug.assert(extirq_body_len == 6);
-    std.debug.assert(crs_resources_len == 23);
+    // Cross-check each length against the field widths it holds, so a wrong
+    // constant trips the assert. A large resource carries a 3-byte header
+    // (tag + u16 length); the EndTag is 2 bytes.
+    std.debug.assert(@sizeOf(u8) + @sizeOf(u32) + @sizeOf(u32) == mem32_body_len);
+    std.debug.assert(@sizeOf(u8) + @sizeOf(u8) + @sizeOf(u32) == extirq_body_len);
+    std.debug.assert(3 + mem32_body_len + 3 + extirq_body_len + 2 == crs_resources_len);
 }
 
 /// Write an ACPI PkgLength for a package whose content (not counting the
