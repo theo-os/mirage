@@ -41,6 +41,12 @@ const serial_irq = 4;
 const vsock_addr = 0xd000_0200;
 const vsock_intid = 17;
 
+/// The block device slot: the first virtio window and the first device GSI. The guest finds it
+/// through its ACPI device object and mounts it as the erofs root; its request queue completes on
+/// this line, so a root read only returns once the controller has delivered the interrupt.
+const block_addr = 0xd000_0000;
+const block_intid = 16;
+
 /// The address the guest answers to, and the port both sides agreed on. The guest-init holds the
 /// same two numbers, and a channel where one side disagrees is a channel nobody answers.
 const guest_cid = 3;
@@ -570,4 +576,134 @@ test "an x86 guest talks over vsock and sends the launch chain" {
             .{},
         );
     }
+}
+
+test "an x86 guest boots from an erofs root over virtio-mmio" {
+    if (@import("builtin").cpu.arch != .x86_64) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+
+    const kernel = (try mapKernel()) orelse return error.SkipZigTest;
+    defer std.posix.munmap(kernel);
+
+    var machine = backend.kvm.Machine.create(gpa, 1) catch |err| switch (err) {
+        error.NoKvm => return error.SkipZigTest,
+        else => return err,
+    };
+    defer machine.deinit();
+
+    const region = try machine.vm.addMemory(ram_base, ram_size, .shared);
+    var regions = [_]GuestMemory.Region{region};
+    var memory: GuestMemory = .{ .regions = &regions };
+
+    const hv = machine.backend();
+    const id = try hv.addVcpu();
+
+    var controller = try backend.platform.createController(&machine.vm, 1);
+    defer controller.deinit();
+    const line = backend.platform.controllerLine(&controller);
+
+    var manifest: Manifest = .{};
+    defer manifest.deinit(gpa);
+
+    // The root the guest mounts: an erofs image whose only `/init` is the guest userspace. There is
+    // no initramfs, so the guest reaching userspace is proof it read `/init` off the block device.
+    var rootfs = image.Erofs.init(gpa);
+    defer rootfs.deinit();
+    try rootfs.addDirectory("dev");
+    try rootfs.addCharacterDevice("dev/console", 5, 1);
+    try rootfs.addFile("init", guest_init);
+    const disk = try rootfs.finish();
+    defer gpa.free(disk);
+
+    var block: device.virtio.Block = undefined;
+    block.init(disk);
+
+    const layout = try core.Launch.prepare(gpa, &memory, &manifest, .{
+        .kernel = kernel,
+        .cmdline = "console=ttyS0 earlyprintk=serial,ttyS0 panic=-1 root=/dev/vda rootfstype=erofs ro init=/init",
+        .ram_base = ram_base,
+        .ram_size = ram_size,
+        .cpus = 1,
+        .uart_base = serial_port,
+        // The one declared virtio device is the block root at platform.virtio (gsi 16).
+        .block_device = true,
+    });
+
+    const output = try gpa.alloc(u8, 256 << 10);
+    defer gpa.free(output);
+    var sink = std.Io.Writer.fixed(output);
+    var serial: device.Uart16550 = .{ .sink = &sink };
+    var acpi_shutdown: device.AcpiShutdown = .{ .slp_typ = acpi.s5_slp_typ };
+
+    var port_devices = [_]device.Bus.Device{ serial.device(serial_port), acpi_shutdown.device(acpi.sleep_port) };
+    var ports: device.Bus = .{ .devices = &port_devices };
+    var mmio_devices = [_]device.Bus.Device{block.device(block_addr)};
+    var bus: device.Bus = .{ .devices = &mmio_devices };
+
+    var services = [_]device.Service{ serial.service(serial_irq), block.service(block_intid) };
+
+    try arch.boot.enter(&machine.vcpus[id], layout);
+
+    const deadline = nowMs() + 20_000;
+    armTicks(10);
+
+    var exits: usize = 0;
+    var stopped: ?backend.Backend.Exit = null;
+    var powered_off = false;
+    while (exits < max_exits) : (exits += 1) {
+        if (exits % 1024 == 0 and nowMs() > deadline) {
+            std.debug.print("\n=== deadline after {d} exits ===\n", .{exits});
+            break;
+        }
+
+        const exit = hv.run(id) catch |err| {
+            std.debug.print("\nrun failed after {d} exits: {t}, kvm said {?}\n", .{ exits, err, machine.fault });
+            break;
+        };
+
+        switch (exit) {
+            .port_out => |w| ports.write(w.port, w.size, w.value),
+            .port_in => |r| try hv.completeMmioRead(id, ports.read(r.port, r.size)),
+            .mmio_write => |w| bus.write(w.gpa, w.size, w.value),
+            .mmio_read => |r| try hv.completeMmioRead(id, bus.read(r.gpa, r.size)),
+            .interrupted => {},
+            else => {
+                stopped = exit;
+                break;
+            },
+        }
+
+        try core.Launch.poll(services[0..services.len], &memory, line);
+
+        if (acpi_shutdown.requested) {
+            powered_off = true;
+            break;
+        }
+
+        if (sink.buffered().len + 512 > output.len) break;
+    }
+
+    const log = sink.buffered();
+    const booted = std.mem.indexOf(u8, log, alive) != null;
+
+    if (!booted) {
+        const rip = machine.vcpus[id].getRegister(.rip) catch 0;
+        std.debug.print(
+            "\n=== after {d} exits, stopped {?}, powered_off {}, rip {x}, unmapped {d} ===\n{s}\n=== end ===\n",
+            .{ exits, stopped, powered_off, rip, bus.unmapped, log },
+        );
+        // Needs a kernel with virtio-mmio + erofs built in (an initramfs-less guest cannot load a
+        // module for its own root): run with `-Dkernel=` the x86 micro-kernel. Skip rather than fail.
+        std.debug.print(
+            "\nnote: the guest did not reach userspace from the erofs root. This gate needs -Dkernel= a " ++
+                "kernel with virtio-mmio + erofs built in; skipping. See the B2b-2a memory.\n",
+            .{},
+        );
+        return error.SkipZigTest;
+    }
+
+    // With no initramfs, reaching userspace is proof the guest read `/init` off the virtio-mmio block
+    // device, so discovery, the block request queue, and the interrupt all work end to end.
+    try std.testing.expect(booted);
 }

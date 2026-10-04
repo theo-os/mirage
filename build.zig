@@ -411,6 +411,17 @@ pub fn build(b: *std.Build) void {
         b.step("test-x86vsock", "Boot a real x86 kernel and talk to the guest over vsock under KVM")
             .dependOn(&b.addRunArtifact(x86vsock_tests).step);
 
+        // The x86 block gate: the guest mounts an erofs image as its root over the virtio-mmio block
+        // device and reaches userspace from it. Needs `-Dkernel=` a kernel with virtio-mmio + erofs
+        // built in; skips otherwise. Its own step so `zig build test` does not need an x86 kernel.
+        const x86block_tests = b.addTest(.{
+            .name = "x86block",
+            .root_module = x86boot_module,
+            .filters = &.{"erofs root"},
+        });
+        b.step("test-x86block", "Boot a real x86 kernel from an erofs root over virtio-mmio under KVM")
+            .dependOn(&b.addRunArtifact(x86block_tests).step);
+
         // Stops a guest, moves it to a machine that has never run, and lets it carry on. Its own
         // target because it needs a kernel and because what it proves is separate.
         const snapshot_module = b.createModule(.{
