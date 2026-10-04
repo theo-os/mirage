@@ -78,3 +78,20 @@ pub fn cpusThatFit(ram_base: u64) u32 {
     _ = ram_base;
     return 255;
 }
+
+/// Read the AMD SEV C-bit position from CPUID leaf 0x8000001F, EBX bits [5:0].
+pub fn hostCBit() u6 {
+    var eax_out: u32 = undefined;
+    var ebx: u32 = undefined;
+    var ecx_out: u32 = undefined;
+    var edx_out: u32 = undefined;
+    asm volatile ("cpuid"
+        : [a] "={eax}" (eax_out),
+          [b] "={ebx}" (ebx),
+          [c] "={ecx}" (ecx_out),
+          [d] "={edx}" (edx_out),
+        : [leaf] "{eax}" (@as(u32, 0x8000001F)),
+          [sub] "{ecx}" (@as(u32, 0)),
+    );
+    return @intCast(ebx & 0x3f);
+}

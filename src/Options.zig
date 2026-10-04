@@ -39,6 +39,8 @@ pub const usage =
     \\  --share <name>=<dir>  offer that directory under that name, read only
     \\  --share <n>=<dir>:write  offer it and let the guest change what is in it
     \\  --session <path>      hold the guest up for whoever connects here
+    \\  --sev yes             launch the guest under AMD SEV
+    \\  --sev-policy <n>      SEV launch policy, 0 by default
     \\
 ;
 
@@ -107,6 +109,11 @@ share_count: usize = 0,
 /// way stays until whoever connects says to stop, or until the guest stops itself, which is
 /// what a caller that runs many calls in one guest needs.
 session: ?[]const u8 = null,
+
+/// Whether to launch the guest under AMD SEV. The C-bit is read from the host CPU.
+sev: bool = false,
+/// The SEV launch policy. Zero selects the default (no debug, no key sharing).
+sev_policy: u32 = 0,
 
 /// How many a caller may name at boot. A harness names its store, the place work happens, a cache, a
 /// scratch area, somewhere to keep notes, and whatever a project binds, so the number is not small.
@@ -194,6 +201,10 @@ pub fn parse(args: []const [:0]const u8) !Options {
             options.save = value;
         } else if (std.mem.eql(u8, name, "--restore")) {
             options.restore = value;
+        } else if (std.mem.eql(u8, name, "--sev")) {
+            options.sev = std.mem.eql(u8, value, "yes");
+        } else if (std.mem.eql(u8, name, "--sev-policy")) {
+            options.sev_policy = try std.fmt.parseInt(u32, value, 0);
         } else if (std.mem.eql(u8, name, "--net")) {
             options.net = .{ .path = value };
         } else if (std.mem.eql(u8, name, "--net-fd")) {

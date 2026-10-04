@@ -643,6 +643,9 @@ pub const Config = struct {
     ram_size: u64,
     cpus: u32,
     uart_base: u64,
+    /// The C-bit position from CPUID 0x8000001F EBX[5:0], set only under AMD SEV.
+    /// Null keeps the non-SEV page table entries byte-identical.
+    sev_c_bit: ?u6 = null,
 };
 
 /// The virtio window size each device gets. Matches the arm stride.
@@ -759,7 +762,7 @@ pub fn prepare(
     var virtio_buf: [5]acpi.VirtioDevice = undefined;
     const virtio = virtioDevicesFromConfig(config, &virtio_buf);
     try buildBootParams(memory, parsed.header, config.cmdline, config.initrd, low, config.cpus, virtio, tpm_desc);
-    try buildLongMode(memory, low, config.ram_size, null);
+    try buildLongMode(memory, low, config.ram_size, config.sev_c_bit);
     try memory.write(kernel_base, protected);
 
     for (measuring) |tag| try manifest.add(gpa, tag, switch (tag) {

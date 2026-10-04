@@ -35,18 +35,39 @@ gpa: std.mem.Allocator,
 /// What KVM actually said, behind the last `HypervisorFault`.
 fault: ?anyerror = null,
 
+fn init(gpa: std.mem.Allocator, cpus: u32, vm: Vm) Error!Machine {
+    std.debug.assert(cpus > 0);
+    if (cpus > vm.maxVcpus()) return Error.TooManyVcpus;
+    return .{ .vm = vm, .vcpus = try gpa.alloc(Vcpu, cpus), .gpa = gpa };
+}
+
 /// Make a machine with room for `cpus` of them. The kernel is asked whether it allows that many before
 /// anything is allocated, so a caller asking for too many is told so rather than finding out on the
 /// CPU that fails.
 pub fn create(gpa: std.mem.Allocator, cpus: u32) Error!Machine {
-    std.debug.assert(cpus > 0);
-
     var vm = try Vm.create();
     errdefer vm.deinit();
+    return init(gpa, cpus, vm);
+}
 
-    if (cpus > vm.maxVcpus()) return Error.TooManyVcpus;
+/// Make a SEV machine. The VM is opened as KVM_X86_SEV_VM (type 2) and SEV_INIT2 is called
+/// before any vCPU or memory slot is added.
+pub fn createSev(gpa: std.mem.Allocator, cpus: u32) Error!Machine {
+    var vm = try Vm.createWithType(2);
+    errdefer vm.deinit();
+    try vm.sevInit2();
+    return init(gpa, cpus, vm);
+}
 
-    return .{ .vm = vm, .vcpus = try gpa.alloc(Vcpu, cpus), .gpa = gpa };
+pub fn sevSeal(self: *Machine, region: Backend.GuestMemory.Region, measure: []u8) Error!?[]const u8 {
+    std.debug.assert(region.backing == .shared);
+    const uaddr = @intFromPtr(region.backing.shared.ptr);
+    const len = region.backing.shared.len;
+    try self.vm.launchUpdateData(uaddr, len);
+    const got = try self.vm.launchMeasure(measure);
+    try self.vm.launchFinish();
+    if (got.len == 0) return null;
+    return got;
 }
 
 pub fn deinit(self: *Machine) void {

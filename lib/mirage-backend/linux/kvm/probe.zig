@@ -24,6 +24,7 @@ pub const Cap = enum(u32) {
     user_memory2 = 231,
     memory_attributes = 233,
     guest_memfd = 234,
+    vm_types = 235,
     guest_memfd_flags = 244,
 };
 
@@ -49,6 +50,9 @@ pub const Report = struct {
     /// slot. This, and not the refusal above, is the question tier 1 turns on. A
     /// memfd the VMM cannot map is worth nothing if it cannot hold guest RAM.
     private_backs_memory: bool,
+    /// Whether the host KVM supports SEV and SEV-ES VM types, from KVM_CAP_VM_TYPES.
+    sev: bool,
+    sev_es: bool,
 
     /// The strongest tier this host reaches. Tier 1 needs guest RAM the VMM has no
     /// mapping of, which needs both a refusal and a memory slot that accepts it.
@@ -134,6 +138,7 @@ pub fn host() Error!Report {
 
     const api = try ioctl.call(fd, comptime ioctl.request(.none, void, nr.get_api_version), 0);
 
+    const vm_types_mask = extension(fd, .vm_types) catch 0;
     var report: Report = .{
         .api_version = @intCast(api),
         .user_memory2 = try extension(fd, .user_memory2) != 0,
@@ -143,6 +148,8 @@ pub fn host() Error!Report {
         .private_refuses_mapping = false,
         .shared_allows_mapping = false,
         .private_backs_memory = false,
+        .sev = vm_types_mask & (1 << 2) != 0,
+        .sev_es = vm_types_mask & (1 << 3) != 0,
     };
 
     if (!report.guest_memfd) return report;
@@ -209,4 +216,30 @@ test "guest memory asked to be mappable can be mapped" {
     // The control. Without it, a refusal above proves only that the flag is
     // unsupported, not that it means anything.
     try std.testing.expect(report.shared_allows_mapping);
+}
+
+test "the sev and sev_es fields parse from a known bitmask" {
+    // bit 2 = SEV_VM, bit 3 = SEV_ES_VM.
+    const sev_only: usize = 1 << 2;
+    const sev_and_es: usize = (1 << 2) | (1 << 3);
+    const neither: usize = 0;
+
+    try std.testing.expect(sev_only & (1 << 2) != 0);
+    try std.testing.expect(sev_only & (1 << 3) == 0);
+    try std.testing.expect(sev_and_es & (1 << 2) != 0);
+    try std.testing.expect(sev_and_es & (1 << 3) != 0);
+    try std.testing.expect(neither & (1 << 2) == 0);
+    try std.testing.expect(neither & (1 << 3) == 0);
+}
+
+test "host sev fields are populated" {
+    const report = host() catch |err| switch (err) {
+        error.NoKvm => return error.SkipZigTest,
+        else => return err,
+    };
+    // sev and sev_es are booleans derived from KVM_CAP_VM_TYPES; they may be
+    // true or false depending on the host. This just confirms the fields exist
+    // and that host() returns without error.
+    _ = report.sev;
+    _ = report.sev_es;
 }

@@ -276,7 +276,14 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         null;
     defer if (disk) |bytes| gpa.free(bytes);
 
-    var machine = backend.kvm.Machine.create(gpa, options.cpus) catch |err| switch (err) {
+    const create_machine = if (comptime @import("builtin").cpu.arch == .x86_64)
+        if (options.sev)
+            backend.kvm.Machine.createSev(gpa, options.cpus)
+        else
+            backend.kvm.Machine.create(gpa, options.cpus)
+    else
+        backend.kvm.Machine.create(gpa, options.cpus);
+    var machine = create_machine catch |err| switch (err) {
         // How many CPUs a guest may have is the kernel's answer, so a refusal is reported as the
         // machine's and not as a limit of this program.
         error.TooManyVcpus => {
@@ -406,10 +413,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         });
     }
 
-    const layout = if (came_back != null) core.Launch.Layout{
-        .entry = 0,
-        .device_tree = 0,
-    } else try core.Launch.prepare(gpa, &memory, &manifest, .{
+    var launch_config: core.Launch.Config = .{
         .kind = if (options.firmware != null)
             .{ .firmware = .{ .at = options.firmware_at, .len = firmware_room } }
         else
@@ -429,7 +433,28 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         .net = options.net != null or options.nat,
         .tpm = options.tpm != null,
         .share = options.share_count > 0,
-    });
+    };
+
+    if (comptime @import("builtin").cpu.arch == .x86_64) {
+        if (came_back == null and options.sev) {
+            launch_config.sev_c_bit = arch.platform.hostCBit();
+            try machine.vm.launchStart(options.sev_policy);
+        }
+    }
+
+    const layout = if (came_back != null) core.Launch.Layout{
+        .entry = 0,
+        .device_tree = 0,
+    } else try core.Launch.prepare(gpa, &memory, &manifest, launch_config);
+
+    if (comptime @import("builtin").cpu.arch == .x86_64) {
+        if (came_back == null and options.sev) {
+            var measure_buf: [256]u8 = undefined;
+            if (try machine.sevSeal(region, &measure_buf)) |got| {
+                try out.print("sev launch sealed, measurement {d} bytes\n", .{got.len});
+            }
+        }
+    }
 
     ready_at = std.Io.Clock.awake.now(io).nanoseconds;
 
