@@ -464,12 +464,25 @@ pub fn build(buf: []u8, base_phys: u64, opts: Options) !Built {
     xsdt_entries[n] = fadt_phys; n += 1;
     xsdt_entries[n] = madt_phys; n += 1;
     if (opts.tpm) |t| {
-        const tpm2_phys = try b.tpm2(.{
-            .control_address = t.control,
-            .start_method = 6,
-            .log_area_start = t.log_addr,
-            .log_area_length = t.log_len,
-        });
+        // The TPM2 table, hand-built to the TCG2 layout the kernel reads the event log from: the log
+        // fields sit at offset 64 (after a 12-byte start-method area), for a 76-byte table. almanac's
+        // tpm2() places them at 52, which the kernel's tpm_read_log_acpi does not read.
+        var tpm2_bytes = [_]u8{0} ** 76;
+        @memcpy(tpm2_bytes[0..4], "TPM2");
+        std.mem.writeInt(u32, tpm2_bytes[4..8], 76, .little);
+        tpm2_bytes[8] = 4; // revision
+        @memcpy(tpm2_bytes[10..16], "MIDSTL");
+        @memcpy(tpm2_bytes[16..24], "ALMANAC ");
+        std.mem.writeInt(u32, tpm2_bytes[24..28], 1, .little);
+        @memcpy(tpm2_bytes[28..32], "ALMA");
+        std.mem.writeInt(u32, tpm2_bytes[32..36], 1, .little);
+        std.mem.writeInt(u64, tpm2_bytes[40..48], t.control, .little); // control address
+        std.mem.writeInt(u32, tpm2_bytes[48..52], 6, .little); // start method: TIS
+        // 52..64 start-method-specific parameters stay zero for TIS.
+        std.mem.writeInt(u32, tpm2_bytes[64..68], t.log_len, .little); // log_area_minimum_length
+        std.mem.writeInt(u64, tpm2_bytes[68..76], t.log_addr, .little); // log_area_start_address
+        tpm2_bytes[9] = almanac.checksum.compute(&tpm2_bytes);
+        const tpm2_phys = try b.addRaw(&tpm2_bytes);
         xsdt_entries[n] = tpm2_phys; n += 1;
     }
 
@@ -770,8 +783,11 @@ test "the acpi set carries a tpm2 table when a tpm is given" {
     const tpm2 = (try tabs.findAs(almanac.Tpm2)).?;
     try testing.expectEqual(@as(u64, 0xfed4_0000), tpm2.controlAddress());
     try testing.expectEqual(almanac.tables.tpm2.StartMethod.tis, tpm2.startMethod());
-    try testing.expectEqual(@as(?u32, 0x1000), tpm2.logAreaLength());
-    try testing.expectEqual(@as(?u64, 0x90000), tpm2.logAreaStart());
+    // The log fields sit at the TCG2 offsets the kernel reads (64 and 68), not almanac's 52/56, so
+    // they are read straight from the table bytes. The table is 76 bytes for exactly this reason.
+    try testing.expectEqual(@as(u32, 76), std.mem.readInt(u32, tpm2.bytes[4..8], .little));
+    try testing.expectEqual(@as(u32, 0x1000), std.mem.readInt(u32, tpm2.bytes[64..68], .little));
+    try testing.expectEqual(@as(u64, 0x90000), std.mem.readInt(u64, tpm2.bytes[68..76], .little));
 
     // Build without a TPM. Verify no TPM2 table in the set.
     const built_no_tpm = try build(&buf, base, .{});

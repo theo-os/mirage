@@ -947,9 +947,10 @@ test "x86 boot reserves a measurement log and names it in the tpm2 table" {
     const tabs = try Tables.init(.{ .offset = offset }, rsdp_addr);
     const tpm2 = (try tabs.findAs(@import("almanac").Tpm2)).?;
 
-    // The TPM2 table must name log_base and the correct log length.
-    try testing.expectEqual(@as(?u64, log_base), tpm2.logAreaStart());
-    try testing.expectEqual(@as(?u32, @intCast(expected_log_len)), tpm2.logAreaLength());
+    // The TPM2 table must name log_base and the correct log length. The log fields are read at the
+    // TCG2 offsets the kernel uses (64 and 68), not almanac's 52/56.
+    try testing.expectEqual(@as(u32, @intCast(expected_log_len)), std.mem.readInt(u32, tpm2.bytes[64..68], .little));
+    try testing.expectEqual(@as(u64, log_base), std.mem.readInt(u64, tpm2.bytes[68..76], .little));
     try testing.expectEqual(@as(u64, 0xfed4_0000), tpm2.controlAddress());
 
     // An e820 entry of type 2 (reserved) must cover [log_base, log_base+log_len).
