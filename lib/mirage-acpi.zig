@@ -182,6 +182,10 @@ const mem32_body_len: usize = 9; // info(1) + base(4) + length(4)
 const extirq_body_len: usize = 6; // flags(1) + count(1) + gsi(4)
 const crs_resources_len: usize = 23; // Memory32Fixed + ExtInterrupt + EndTag
 
+// Fixed resource lengths for the TPM TIS device _CRS.
+// Only a Memory32Fixed (12 bytes) + EndTag (2 bytes): no interrupt.
+const tpm_crs_resources_len: usize = 14;
+
 comptime {
     // Cross-check each length against the field widths it holds, so a wrong
     // constant trips the assert. A large resource carries a 3-byte header
@@ -189,6 +193,8 @@ comptime {
     std.debug.assert(@sizeOf(u8) + @sizeOf(u32) + @sizeOf(u32) == mem32_body_len);
     std.debug.assert(@sizeOf(u8) + @sizeOf(u8) + @sizeOf(u32) == extirq_body_len);
     std.debug.assert(3 + mem32_body_len + 3 + extirq_body_len + 2 == crs_resources_len);
+    std.debug.assert(mem32_body_len == 9);
+    std.debug.assert(tpm_crs_resources_len == 14); // Memory32Fixed(12) + EndTag(2)
 }
 
 /// Write an ACPI PkgLength for a package whose content (not counting the
@@ -303,6 +309,76 @@ pub fn emitSystemBus(buf: []u8, devs: []const VirtioDevice) usize {
     return p;
 }
 
+/// Write Device(TPM0){ Name(_HID,"MSFT0101") Name(_CRS,...) } into buf.
+/// Returns bytes written. No _UID; _CRS holds only Memory32Fixed + EndTag.
+fn emitTpmDevice(buf: []u8, control: u32) usize {
+    // Resource descriptors: Memory32Fixed(12) + EndTag(2) = 14 bytes.
+    var resources: [tpm_crs_resources_len]u8 = undefined;
+    resources[0] = 0x86; // Memory32Fixed tag
+    resources[1] = mem32_body_len; // body length = 9
+    resources[2] = 0x00; // high byte of u16 body length
+    resources[3] = 0x01; // ReadWrite
+    std.mem.writeInt(u32, resources[4..8], control, .little);
+    std.mem.writeInt(u32, resources[8..12], 0x5000, .little); // TIS size
+    resources[12] = 0x79; // EndTag
+    resources[13] = 0x00;
+
+    // _CRS Name: NameOp + "_CRS" + BufferOp + PkgLength + BufferSize + resources.
+    // BufferPkg content = BufferSize(2) + resources(14) = 16; total1 = 17 < 0x40.
+    var crs: [32]u8 = undefined;
+    var cp: usize = 0;
+    crs[cp] = 0x08; cp += 1; // NameOp
+    crs[cp] = 0x5F; crs[cp + 1] = 0x43; crs[cp + 2] = 0x52; crs[cp + 3] = 0x53; cp += 4; // _CRS
+    crs[cp] = 0x11; cp += 1; // BufferOp
+    cp += writePkgLength(crs[cp..], 2 + tpm_crs_resources_len); // 16
+    crs[cp] = almanac.aml.encoding.byte_prefix; cp += 1;
+    crs[cp] = tpm_crs_resources_len; cp += 1; // 0x0E = 14
+    @memcpy(crs[cp .. cp + tpm_crs_resources_len], &resources);
+    cp += tpm_crs_resources_len;
+    const crs_len = cp;
+
+    // Name(_HID,"MSFT0101"): same encoding as LNRO0005, 15 bytes.
+    const hid = [15]u8{
+        0x08, // NameOp
+        0x5F, 0x48, 0x49, 0x44, // _HID
+        0x0D, // StringPrefix
+        'M', 'S', 'F', 'T', '0', '1', '0', '1',
+        0x00, // NUL
+    };
+
+    // Device body: _HID(15) + _CRS(crs_len). No _UID for TPM0.
+    const body_len = hid.len + crs_len;
+    const pkg_content = 4 + body_len; // NameSeg(4) + body
+
+    var p: usize = 0;
+    buf[p] = 0x5B; p += 1; // ExtOpPrefix
+    buf[p] = 0x82; p += 1; // DeviceOp
+    p += writePkgLength(buf[p..], pkg_content);
+    buf[p] = 'T'; p += 1;
+    buf[p] = 'P'; p += 1;
+    buf[p] = 'M'; p += 1;
+    buf[p] = '0'; p += 1;
+    @memcpy(buf[p .. p + hid.len], &hid); p += hid.len;
+    @memcpy(buf[p .. p + crs_len], crs[0..crs_len]); p += crs_len;
+    return p;
+}
+
+/// Write Scope(\_SB_){ Device(TPM0){...} } into buf. Returns bytes written.
+pub fn emitTpmScope(buf: []u8, control: u32) usize {
+    var scratch: [128]u8 = undefined;
+    const dev_len = emitTpmDevice(&scratch, control);
+
+    // Scope(\_SB_): ScopeOp + PkgLength + \_SB_(5) + device
+    const scope_content = 5 + dev_len;
+    var p: usize = 0;
+    buf[p] = 0x10; p += 1; // ScopeOp
+    p += writePkgLength(buf[p..], scope_content);
+    buf[p] = 0x5C; p += 1; // root_char '\'
+    buf[p] = 0x5F; buf[p + 1] = 0x53; buf[p + 2] = 0x42; buf[p + 3] = 0x5F; p += 4; // _SB_
+    @memcpy(buf[p .. p + dev_len], scratch[0..dev_len]); p += dev_len;
+    return p;
+}
+
 /// Build an RSDP, XSDT, hardware-reduced FADT, and DSDT carrying _S5 into
 /// `buf` at guest physical address `base_phys`. Returns the bytes written and
 /// the RSDP's physical address as the Builder placed it.
@@ -313,14 +389,21 @@ pub fn build(buf: []u8, base_phys: u64, opts: Options) !Built {
     // the FADT's DSDT and X_DSDT fields are written. The DSDT is referenced
     // only by the FADT and is never listed in the XSDT (ACPI rule).
     //
-    // When virtio devices are given, the DSDT body = s5_aml ++ emitSystemBus(virtio).
-    // When none are given, use s5_aml directly (byte-identical to pre-device builds).
+    // Body = s5_aml ++ emitSystemBus(virtio)? ++ emitTpmScope(control)?
+    // When neither virtio nor tpm, use s5_aml directly (byte-identical).
     const dsdt_phys = dsdt: {
-        if (opts.virtio.len == 0) break :dsdt try b.addTable("DSDT", &s5_aml, 2);
+        if (opts.virtio.len == 0 and opts.tpm == null) {
+            break :dsdt try b.addTable("DSDT", &s5_aml, 2);
+        }
         var body: [512]u8 = undefined;
         @memcpy(body[0..s5_aml.len], &s5_aml);
-        const sb_len = emitSystemBus(body[s5_aml.len..], opts.virtio);
-        const total = s5_aml.len + sb_len;
+        var total = s5_aml.len;
+        if (opts.virtio.len > 0) {
+            total += emitSystemBus(body[total..], opts.virtio);
+        }
+        if (opts.tpm) |t| {
+            total += emitTpmScope(body[total..], @intCast(t.control));
+        }
         std.debug.assert(total <= body.len);
         break :dsdt try b.addTable("DSDT", body[0..total], 2);
     };
@@ -694,6 +777,142 @@ test "the acpi set carries a tpm2 table when a tpm is given" {
     const built_no_tpm = try build(&buf, base, .{});
     const tabs_no_tpm = try Tables.init(.{ .offset = offset }, built_no_tpm.rsdp);
     try testing.expectEqual(@as(?almanac.Tpm2, null), try tabs_no_tpm.findAs(almanac.Tpm2));
+}
+
+test "the dsdt names the tpm as an msft0101 device" {
+    var buf: [4096]u8 align(16) = undefined;
+    const base: u64 = 0x80000;
+    const Tables = almanac.TablesGeneric(almanac.OffsetMapper);
+    const offset: u64 = @intFromPtr(&buf) -% base;
+
+    // Build with tpm only (no virtio). Decode DSDT and find MSFT0101 device.
+    const built = try build(&buf, base, .{
+        .tpm = .{ .control = 0xfed4_0000 },
+    });
+    {
+        const tabs = try Tables.init(.{ .offset = offset }, built.rsdp);
+        const fadt = (try tabs.findAs(almanac.Fadt)).?;
+        const dsdt_addr = fadt.preferredDsdt();
+        const dsdt_hdr = (almanac.OffsetMapper{ .offset = offset }).slice(dsdt_addr, 36);
+        const dsdt_total: usize = std.mem.readInt(u32, dsdt_hdr[4..8], .little);
+        const dsdt_bytes = (almanac.OffsetMapper{ .offset = offset }).slice(dsdt_addr, dsdt_total);
+        const aml_body = dsdt_bytes[36..];
+
+        // Find the TPM0 Device (5B 82) in the AML body.
+        var device_off: ?usize = null;
+        var i: usize = 0;
+        while (i + 1 < aml_body.len) : (i += 1) {
+            if (aml_body[i] == 0x5B and aml_body[i + 1] == 0x82) {
+                device_off = i;
+                break;
+            }
+        }
+        try std.testing.expect(device_off != null);
+
+        const dev_start = device_off.?;
+        const pkg = try almanac.aml.encoding.pkgLength(aml_body[dev_start + 2 ..]);
+        const nameseg_off = dev_start + 2 + pkg.byte_count;
+        try std.testing.expect(std.mem.eql(u8, aml_body[nameseg_off .. nameseg_off + 4], "TPM0"));
+
+        const body_start = nameseg_off + 4;
+        const device_end = dev_start + 2 + pkg.value;
+        var body_pos = body_start;
+        var found_hid = false;
+        var crs_resource_bytes: []const u8 = &.{};
+
+        while (body_pos < device_end) {
+            if (aml_body[body_pos] != 0x08) break;
+            const name_bytes = aml_body[body_pos + 1 ..];
+            const ns = try almanac.aml.encoding.nameString(name_bytes);
+            const value_off = body_pos + 1 + ns.byte_count;
+
+            if (ns.segments.len == 1 and std.mem.eql(u8, &ns.segments[0], "_HID")) {
+                try std.testing.expect(aml_body[value_off] == 0x0D);
+                const str_end = std.mem.indexOfScalarPos(u8, aml_body, value_off + 1, 0).?;
+                try std.testing.expect(std.mem.eql(u8, aml_body[value_off + 1 .. str_end], "MSFT0101"));
+                found_hid = true;
+                body_pos = str_end + 1;
+            } else if (ns.segments.len == 1 and std.mem.eql(u8, &ns.segments[0], "_CRS")) {
+                const buf_op_off = value_off;
+                try std.testing.expect(aml_body[buf_op_off] == 0x11);
+                const buf_pkg = try almanac.aml.encoding.pkgLength(aml_body[buf_op_off + 1 ..]);
+                const res_off = buf_op_off + 1 + buf_pkg.byte_count + 2;
+                const crs_end = buf_op_off + 1 + buf_pkg.value;
+                crs_resource_bytes = aml_body[res_off..crs_end];
+                body_pos = crs_end;
+            } else {
+                break;
+            }
+        }
+
+        try std.testing.expect(found_hid);
+        try std.testing.expect(crs_resource_bytes.len > 0);
+
+        // _CRS must have Memory32Fixed(base=0xfed40000, len=0x5000) and nothing else.
+        var res_it = almanac.resource.iterate(crs_resource_bytes);
+        const r0 = (try res_it.next()).?;
+        try std.testing.expect(r0 == .fixed_memory32);
+        try testing.expectEqual(@as(u32, 0xfed4_0000), r0.fixed_memory32.base);
+        try testing.expectEqual(@as(u32, 0x5000), r0.fixed_memory32.length);
+        try std.testing.expect((try res_it.next()) == null); // no interrupt
+    }
+
+    // Build with both virtio and tpm: both devices must decode.
+    const dev = VirtioDevice{ .addr = 0xd0000200, .size = 0x200, .gsi = 17 };
+    const built2 = try build(&buf, base, .{
+        .virtio = &.{dev},
+        .tpm = .{ .control = 0xfed4_0000 },
+    });
+    {
+        const tabs = try Tables.init(.{ .offset = offset }, built2.rsdp);
+        const fadt = (try tabs.findAs(almanac.Fadt)).?;
+        const dsdt_addr = fadt.preferredDsdt();
+        const dsdt_hdr = (almanac.OffsetMapper{ .offset = offset }).slice(dsdt_addr, 36);
+        const dsdt_total: usize = std.mem.readInt(u32, dsdt_hdr[4..8], .little);
+        const dsdt_bytes = (almanac.OffsetMapper{ .offset = offset }).slice(dsdt_addr, dsdt_total);
+        const aml_body = dsdt_bytes[36..];
+
+        var found_lnro = false;
+        var found_msft = false;
+        var i: usize = 0;
+        while (i + 1 < aml_body.len) : (i += 1) {
+            if (aml_body[i] != 0x5B or aml_body[i + 1] != 0x82) continue;
+            const pkg = try almanac.aml.encoding.pkgLength(aml_body[i + 2 ..]);
+            const ns_off = i + 2 + pkg.byte_count;
+            const body_start = ns_off + 4;
+            const device_end = i + 2 + pkg.value;
+            var bp = body_start;
+            while (bp < device_end) {
+                if (aml_body[bp] != 0x08) break;
+                const ns = try almanac.aml.encoding.nameString(aml_body[bp + 1 ..]);
+                const val_off = bp + 1 + ns.byte_count;
+                if (ns.segments.len == 1 and std.mem.eql(u8, &ns.segments[0], "_HID")) {
+                    if (aml_body[val_off] == 0x0D) {
+                        const str_end = std.mem.indexOfScalarPos(u8, aml_body, val_off + 1, 0).?;
+                        const hid_str = aml_body[val_off + 1 .. str_end];
+                        if (std.mem.eql(u8, hid_str, "LNRO0005")) found_lnro = true;
+                        if (std.mem.eql(u8, hid_str, "MSFT0101")) found_msft = true;
+                    }
+                    break;
+                }
+                bp += 1;
+            }
+            i += 1;
+        }
+        try std.testing.expect(found_lnro);
+        try std.testing.expect(found_msft);
+    }
+
+    // Build with neither: DSDT body == s5_aml exactly.
+    const built3 = try build(&buf, base, .{});
+    {
+        const tabs = try Tables.init(.{ .offset = offset }, built3.rsdp);
+        const fadt = (try tabs.findAs(almanac.Fadt)).?;
+        const dsdt_addr = fadt.preferredDsdt();
+        const dsdt_bytes = (almanac.OffsetMapper{ .offset = offset }).slice(dsdt_addr, 36 + s5_aml.len);
+        const body_len = std.mem.readInt(u32, dsdt_bytes[4..8], .little) - 36;
+        try testing.expectEqual(@as(u32, s5_aml.len), body_len);
+    }
 }
 
 test {
