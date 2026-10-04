@@ -20,6 +20,8 @@ pub const s5_slp_typ: u8 = 5;
 pub const Options = struct {
     /// How many Processor Local APIC entries the MADT carries.
     cpus: u32 = 1,
+    /// Virtio-mmio devices to describe as ACPI Device objects in the DSDT.
+    virtio: []const VirtioDevice = &.{},
 };
 
 /// The result of building the table set: the bytes to copy into guest RAM and
@@ -298,7 +300,18 @@ pub fn build(buf: []u8, base_phys: u64, opts: Options) !Built {
     // The DSDT is placed before the FADT so its physical address is known when
     // the FADT's DSDT and X_DSDT fields are written. The DSDT is referenced
     // only by the FADT and is never listed in the XSDT (ACPI rule).
-    const dsdt_phys = try b.addTable("DSDT", &s5_aml, 2);
+    //
+    // When virtio devices are given, the DSDT body = s5_aml ++ emitSystemBus(virtio).
+    // When none are given, use s5_aml directly (byte-identical to pre-device builds).
+    const dsdt_phys = dsdt: {
+        if (opts.virtio.len == 0) break :dsdt try b.addTable("DSDT", &s5_aml, 2);
+        var body: [512]u8 = undefined;
+        @memcpy(body[0..s5_aml.len], &s5_aml);
+        const sb_len = emitSystemBus(body[s5_aml.len..], opts.virtio);
+        const total = s5_aml.len + sb_len;
+        std.debug.assert(total <= body.len);
+        break :dsdt try b.addTable("DSDT", body[0..total], 2);
+    };
 
     // Build the FADT body by hand because almanac's fadt() helper does not set
     // the sleep-control/status registers.
@@ -534,6 +547,103 @@ test "an aml device object decodes back to its resources" {
     try testing.expectEqual(@as(u32, 17), r1.extended_irq.interrupts[0]);
 
     try std.testing.expect((try res_it.next()) == null); // EndTag terminates
+}
+
+test "the dsdt carries a virtio-mmio device when one is given" {
+    var buf: [4096]u8 align(16) = undefined;
+    const base: u64 = 0x80000;
+
+    // Assert that empty virtio yields a DSDT body length equal to s5_aml.len.
+    const empty_built = try build(&buf, base, .{});
+    const Tables = almanac.TablesGeneric(almanac.OffsetMapper);
+    const offset: u64 = @intFromPtr(&buf) -% base;
+    {
+        const tabs = try Tables.init(.{ .offset = offset }, empty_built.rsdp);
+        const fadt = (try tabs.findAs(almanac.Fadt)).?;
+        const dsdt_addr = fadt.preferredDsdt();
+        const dsdt_bytes = (almanac.OffsetMapper{ .offset = offset }).slice(dsdt_addr, 36 + s5_aml.len + 1);
+        const body_len = std.mem.readInt(u32, dsdt_bytes[4..8], .little) - 36;
+        try testing.expectEqual(@as(u32, s5_aml.len), body_len);
+    }
+
+    // Build with one virtio device.
+    const dev = VirtioDevice{ .addr = 0xd0000200, .size = 0x200, .gsi = 17 };
+    const built = try build(&buf, base, .{ .virtio = &.{dev} });
+    const tabs = try Tables.init(.{ .offset = offset }, built.rsdp);
+    const fadt = (try tabs.findAs(almanac.Fadt)).?;
+    const dsdt_addr = fadt.preferredDsdt();
+    try std.testing.expect(dsdt_addr != 0);
+
+    // Read the DSDT: SDT header length field tells us total size.
+    const dsdt_hdr = (almanac.OffsetMapper{ .offset = offset }).slice(dsdt_addr, 36);
+    const dsdt_total: usize = std.mem.readInt(u32, dsdt_hdr[4..8], .little);
+    const dsdt_bytes = (almanac.OffsetMapper{ .offset = offset }).slice(dsdt_addr, dsdt_total);
+    const aml_body = dsdt_bytes[36..];
+
+    // Locate the VR00 device object in the AML body.
+    var device_off: ?usize = null;
+    var i: usize = 0;
+    while (i + 1 < aml_body.len) : (i += 1) {
+        if (aml_body[i] == 0x5B and aml_body[i + 1] == 0x82) {
+            device_off = i;
+            break;
+        }
+    }
+    try std.testing.expect(device_off != null);
+
+    const dev_start = device_off.?;
+    const pkg = try almanac.aml.encoding.pkgLength(aml_body[dev_start + 2 ..]);
+    const nameseg_off = dev_start + 2 + pkg.byte_count;
+    try std.testing.expect(std.mem.eql(u8, aml_body[nameseg_off .. nameseg_off + 4], "VR00"));
+
+    const body_start = nameseg_off + 4;
+    const device_end = dev_start + 2 + pkg.value;
+    var body_pos = body_start;
+    var found_hid = false;
+    var crs_resource_bytes: []const u8 = &.{};
+
+    while (body_pos < device_end) {
+        if (aml_body[body_pos] != 0x08) break;
+        const name_bytes = aml_body[body_pos + 1 ..];
+        const ns = try almanac.aml.encoding.nameString(name_bytes);
+        const value_off = body_pos + 1 + ns.byte_count;
+
+        if (ns.segments.len == 1 and std.mem.eql(u8, &ns.segments[0], "_HID")) {
+            try std.testing.expect(aml_body[value_off] == 0x0D);
+            const str_end = std.mem.indexOfScalarPos(u8, aml_body, value_off + 1, 0).?;
+            try std.testing.expect(std.mem.eql(u8, aml_body[value_off + 1 .. str_end], "LNRO0005"));
+            found_hid = true;
+            body_pos = str_end + 1;
+        } else if (ns.segments.len == 1 and std.mem.eql(u8, &ns.segments[0], "_UID")) {
+            body_pos = value_off + 2;
+        } else if (ns.segments.len == 1 and std.mem.eql(u8, &ns.segments[0], "_CRS")) {
+            const buf_op_off = value_off;
+            try std.testing.expect(aml_body[buf_op_off] == 0x11);
+            const buf_pkg = try almanac.aml.encoding.pkgLength(aml_body[buf_op_off + 1 ..]);
+            const res_off = buf_op_off + 1 + buf_pkg.byte_count + 2;
+            const crs_end = buf_op_off + 1 + buf_pkg.value;
+            crs_resource_bytes = aml_body[res_off..crs_end];
+            body_pos = crs_end;
+        } else {
+            break;
+        }
+    }
+
+    try std.testing.expect(found_hid);
+    try std.testing.expect(crs_resource_bytes.len > 0);
+
+    var res_it = almanac.resource.iterate(crs_resource_bytes);
+    const r0 = (try res_it.next()).?;
+    try std.testing.expect(r0 == .fixed_memory32);
+    try testing.expectEqual(@as(u32, 0xd0000200), r0.fixed_memory32.base);
+    try testing.expectEqual(@as(u32, 0x200), r0.fixed_memory32.length);
+
+    const r1 = (try res_it.next()).?;
+    try std.testing.expect(r1 == .extended_irq);
+    try testing.expectEqual(@as(usize, 1), r1.extended_irq.interrupts.len);
+    try testing.expectEqual(@as(u32, 17), r1.extended_irq.interrupts[0]);
+
+    try std.testing.expect((try res_it.next()) == null);
 }
 
 test {
