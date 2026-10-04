@@ -570,6 +570,29 @@ test "a guest port write reaches a device on the port bus" {
     try testing.expectEqualSlices(u8, "h", sink.buffered());
 }
 
+test "a guest acpi poweroff write ends the run through the shutdown flag" {
+    // The x86 ACPI sleep port and the S5 sleep value, inlined so core needs no acpi dep.
+    const sleep_port = 0x600;
+    const s5_write: u8 = (5 << 2) | (1 << 5);
+
+    var shutdown: device.AcpiShutdown = .{ .slp_typ = 5 };
+    var pdevs = [_]device.Bus.Device{shutdown.device(sleep_port)};
+    var ports: device.Bus = .{ .devices = &pdevs };
+    var mock: Backend.Mock = .init(&.{
+        .{ .port_out = .{ .port = sleep_port, .size = .byte, .value = s5_write } },
+    });
+    const hv = mock.backend();
+    const id = try hv.addVcpu();
+
+    var devices = [_]device.Device{};
+    var bus: device.Bus = .{ .devices = &devices };
+
+    const reason = try run(hv, id, .{ .bus = &bus, .ports = &ports, .shutdown = &shutdown.requested });
+    // Reaching `.shutdown` means the device decoded the S5 write and the flag turned the run.
+    try testing.expectEqual(Reason.shutdown, reason);
+    try testing.expectEqual(true, shutdown.requested);
+}
+
 test "a port write with no port bus faults" {
     // Without a port bus the exit is unexpected and the caller must decide what to do.
     // aarch64 never reaches this arm; on x86 the caller omits ports until a serial is wired.

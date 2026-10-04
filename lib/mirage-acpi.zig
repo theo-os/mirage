@@ -78,6 +78,7 @@ const sleep_status_off: usize = 256;
 // Bit 20 of the FADT flags field: hardware-reduced ACPI platform.
 const flag_hw_reduced: u32 = 1 << 20;
 
+// These three structs pin sizes via @sizeOf for the raw-offset writer, they are never memcpy'd, so do not fold the offset writes into struct stores and pick up padding.
 // MADT fixed header that follows the 36-byte SDT header: local APIC address
 // and the multiple-APIC flags word. Eight bytes total.
 const MadtHeader = extern struct {
@@ -177,7 +178,7 @@ pub fn build(buf: []u8, base_phys: u64, opts: Options) !Built {
     fadt_bytes[8] = 6; // ACPI revision 6
     fadt_bytes[9] = 0; // checksum placeholder
 
-    // OEM / creator fields use almanac's defaults so read-back agrees.
+    // These OEM / creator values mirror almanac.Builder's defaults so read-back agrees, a coupling.
     @memcpy(fadt_bytes[10..16], "MIDSTL");
     @memcpy(fadt_bytes[16..24], "ALMANAC ");
     std.mem.writeInt(u32, fadt_bytes[24..28], 1, .little);
