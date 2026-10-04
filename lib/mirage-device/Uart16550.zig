@@ -10,6 +10,8 @@
 const std = @import("std");
 const testing = @import("mirage-testing");
 const Bus = @import("Bus.zig");
+const Service = @import("../mirage-device.zig").Service;
+const GuestMemory = @import("mirage-memory").GuestMemory;
 
 const Uart16550 = @This();
 
@@ -75,6 +77,18 @@ pub fn signalling(self: *const Uart16550) bool {
     return self.ier & ier_thri != 0;
 }
 
+/// An adapter for the run loop's poll path. The loop raises GSI `intid` when the
+/// poll returns true, and lowers it when false.
+pub fn service(self: *Uart16550, intid: u32) Service {
+    return .{ .ctx = self, .intid = intid, .poll = Uart16550.poll };
+}
+
+fn poll(ctx: *anyopaque, memory: *GuestMemory) Service.Error!bool {
+    _ = memory;
+    const self: *Uart16550 = @ptrCast(@alignCast(ctx));
+    return self.signalling();
+}
+
 fn read(ctx: *anyopaque, offset: u64, size: Bus.Size) u64 {
     _ = size;
     const self: *Uart16550 = @ptrCast(@alignCast(ctx));
@@ -125,4 +139,21 @@ test "the line status register reports the transmitter ready" {
     var devices = [_]Bus.Device{uart.device(0x3f8)};
     var bus: Bus = .{ .devices = &devices };
     try testing.expectEqual(@as(u64, 0x60), bus.read(0x3f8 + 5, .byte));
+}
+
+test "the uart service reports the transmit interrupt" {
+    var buf: [16]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&buf);
+    var uart: Uart16550 = .{ .sink = &sink };
+    var devices = [_]Bus.Device{uart.device(0x3f8)};
+    var bus: Bus = .{ .devices = &devices };
+
+    var regions: [0]GuestMemory.Region = .{};
+    var mem: GuestMemory = .{ .regions = &regions };
+
+    var s = uart.service(4);
+    try std.testing.expect(!(try s.poll(s.ctx, &mem)));
+
+    bus.write(0x3f8 + 1, .byte, ier_thri);
+    try std.testing.expect(try s.poll(s.ctx, &mem));
 }
