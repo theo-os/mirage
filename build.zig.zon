@@ -6,6 +6,10 @@
             .url = "git+https://git.lilithsemi.com/LilithSemi/dtree.git#6ddd53fc04c7480c40557903766c4e8903cd8139",
             .hash = "dtree-0.1.0-76to8CvlAAD18WmH5ygUHdUtrI3XMYabapbwt1qe2bn1",
         },
+        .almanac = .{
+            .url = "git+https://git.lilithsemi.com/LilithSemi/almanac.git#d2f7eab8fe7c1ec2d6e6e4d6363c60275fa363fd",
+            .hash = "almanac-0.1.0-9SzmcDvHBACa842eo4EKst73ItgkAcNlkpO45Ob4Kiib",
+        },
     },
     .paths = .{""},
     .fingerprint = 0xecd09ace8d31239,

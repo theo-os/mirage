@@ -23,6 +23,13 @@ pub fn build(b: *std.Build) void {
         .@"no-docs" = true,
     }).module("dtree");
 
+    const almanac = b.dependency("almanac", .{
+        .target = target,
+        .optimize = optimize,
+        .@"no-tests" = true,
+        .@"no-docs" = true,
+    }).module("almanac");
+
     // Which kernel the gates boot and how many cpus they give the guest. Declared once: a word a
     // caller says has one meaning, and asking for it twice is a mistake this build would not survive.
     const kernel_path = b.option([]const u8, "kernel", "Kernel image for the boot gates") orelse
@@ -49,6 +56,10 @@ pub fn build(b: *std.Build) void {
 
     const attest = add.lib("mirage-attest", &.{});
     const memory = add.lib("mirage-memory", &.{});
+    _ = add.lib("mirage-acpi", &.{
+        .{ .name = "almanac", .module = almanac },
+        .{ .name = "mirage-memory", .module = memory },
+    });
     const device = add.lib("mirage-device", &.{.{ .name = "mirage-memory", .module = memory }});
     const image = add.lib("mirage-image", &.{});
     const net = add.lib("mirage-net", &.{});
