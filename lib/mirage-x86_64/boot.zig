@@ -12,6 +12,7 @@ const GuestMemory = @import("mirage-memory").GuestMemory;
 const attest = @import("mirage-attest");
 const Manifest = attest.Manifest;
 const acpi = @import("mirage-acpi");
+const platform = @import("platform.zig");
 
 pub const Error = error{ TooSmall, NotABzImage, UnsupportedProtocol, No64BitEntry, CmdlineTooLong, TooManyRegions, InitrdTooLarge, OutOfSpace } || GuestMemory.Error;
 
@@ -574,8 +575,33 @@ pub const Config = struct {
     ram_size: u64,
     cpus: u32,
     uart_base: u64,
-    virtio: []const acpi.VirtioDevice = &.{},
 };
+
+/// The virtio window size each device gets. Matches the arm stride.
+const virtio_window_size: u32 = 0x200;
+
+/// Build the ACPI virtio device list from the Config device flags. Returns a slice of a
+/// caller-owned fixed array, so no allocation is needed.
+fn virtioDevicesFromConfig(config: Config, buf: *[4]acpi.VirtioDevice) []const acpi.VirtioDevice {
+    var count: usize = 0;
+    if (config.block_device) {
+        buf[count] = .{ .addr = platform.virtio.addr, .size = virtio_window_size, .gsi = platform.virtio.intid };
+        count += 1;
+    }
+    if (config.vsock) {
+        buf[count] = .{ .addr = platform.vsock.addr, .size = virtio_window_size, .gsi = platform.vsock.intid };
+        count += 1;
+    }
+    if (config.balloon) {
+        buf[count] = .{ .addr = platform.balloon.addr, .size = virtio_window_size, .gsi = platform.balloon.intid };
+        count += 1;
+    }
+    if (config.net) {
+        buf[count] = .{ .addr = platform.net.addr, .size = virtio_window_size, .gsi = platform.net.intid };
+        count += 1;
+    }
+    return buf[0..count];
+}
 
 pub const Layout = struct {
     /// Where the guest starts. The sixty four bit entry is the protected mode base plus the jump the
@@ -623,7 +649,9 @@ pub fn prepare(
         initrd_range = .{ .start = initrd_base, .end = initrd_base + bytes.len };
     }
 
-    try buildBootParams(memory, parsed.header, config.cmdline, config.initrd, low, config.cpus, config.virtio);
+    var virtio_buf: [4]acpi.VirtioDevice = undefined;
+    const virtio = virtioDevicesFromConfig(config, &virtio_buf);
+    try buildBootParams(memory, parsed.header, config.cmdline, config.initrd, low, config.cpus, virtio);
     try buildLongMode(memory, low, config.ram_size);
     try memory.write(kernel_base, protected);
 
@@ -763,4 +791,40 @@ test "boot params build a dsdt with the given virtio device" {
     const pkg = try almanac_mod.aml.encoding.pkgLength(aml_body[dev_start + 2 ..]);
     const nameseg_off = dev_start + 2 + pkg.byte_count;
     try std.testing.expect(std.mem.eql(u8, aml_body[nameseg_off .. nameseg_off + 4], "VR00"));
+}
+
+test "the x86 acpi device list follows the device flags" {
+    // block + balloon present, vsock + net absent.
+    var buf: [4]acpi.VirtioDevice = undefined;
+    const list = virtioDevicesFromConfig(.{
+        .kernel = &.{},
+        .cmdline = "",
+        .ram_base = 0,
+        .ram_size = 0,
+        .cpus = 1,
+        .uart_base = 0,
+        .block_device = true,
+        .balloon = true,
+    }, &buf);
+
+    try testing.expectEqual(@as(usize, 2), list.len);
+    try testing.expectEqual(@as(u64, 0xd000_0000), list[0].addr);
+    try testing.expectEqual(@as(u32, 0x200), list[0].size);
+    try testing.expectEqual(@as(u32, 16), list[0].gsi);
+    try testing.expectEqual(@as(u64, 0xd000_0400), list[1].addr);
+    try testing.expectEqual(@as(u32, 0x200), list[1].size);
+    try testing.expectEqual(@as(u32, 18), list[1].gsi);
+
+    // All flags off: empty list.
+    var buf2: [4]acpi.VirtioDevice = undefined;
+    const empty = virtioDevicesFromConfig(.{
+        .kernel = &.{},
+        .cmdline = "",
+        .ram_base = 0,
+        .ram_size = 0,
+        .cpus = 1,
+        .uart_base = 0,
+        .block_device = false,
+    }, &buf2);
+    try testing.expectEqual(@as(usize, 0), empty.len);
 }

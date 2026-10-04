@@ -39,7 +39,6 @@ const serial_irq = 4;
 /// driver waits on this line for each answer. The interrupt matches the GSI the controller raises
 /// through `Vm.setIrq`; Linux maps it into its IRQ domain from the _CRS.
 const vsock_addr = 0xd000_0200;
-const vsock_size = 0x200;
 const vsock_intid = 17;
 
 /// The address the guest answers to, and the port both sides agreed on. The guest-init holds the
@@ -147,6 +146,7 @@ test "a real x86 kernel boots to its serial banner" {
         .ram_size = ram_size,
         .cpus = 1,
         .uart_base = serial_port,
+        .block_device = false,
     });
 
     // The serial sink. Large enough to hold the banner and a good deal past it, so a kernel that keeps
@@ -274,6 +274,7 @@ test "a real x86 kernel boots to a guest in userspace and stops cleanly" {
         .ram_size = ram_size,
         .cpus = 1,
         .uart_base = serial_port,
+        .block_device = false,
     });
 
     const output = try gpa.alloc(u8, 256 << 10);
@@ -420,10 +421,11 @@ test "an x86 guest talks over vsock and sends the launch chain" {
         .ram_size = ram_size,
         .cpus = 1,
         .uart_base = serial_port,
-        // The guest finds the vsock device through this ACPI device object in the DSDT: the _CRS
-        // names the window and the interrupt, Linux maps that GSI into its IRQ domain, and the
-        // virtio-mmio driver binds to the LNRO0005 identifier. The kernel command line names no device.
-        .virtio = &.{.{ .addr = vsock_addr, .size = vsock_size, .gsi = vsock_intid }},
+        // The guest finds the vsock device through an ACPI device object in the DSDT built from the
+        // platform slot: _CRS names the window and the interrupt, Linux maps that GSI into its IRQ
+        // domain, and the virtio-mmio driver binds to the LNRO0005 identifier.
+        .vsock = true,
+        .block_device = false,
     });
 
     const output = try gpa.alloc(u8, 256 << 10);
