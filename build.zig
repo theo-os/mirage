@@ -377,6 +377,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "mirage-attest", .module = attest },
                 .{ .name = "mirage-image", .module = image },
                 .{ .name = "mirage-net", .module = net },
+                .{ .name = "mirage-fs", .module = filesystem },
                 .{ .name = "boot-options", .module = boot_options.createModule() },
             },
         });
@@ -460,6 +461,17 @@ pub fn build(b: *std.Build) void {
         });
         b.step("test-x86tpm", "Boot a real x86 kernel and verify its launch chain through a tpm under KVM")
             .dependOn(&b.addRunArtifact(x86tpm_tests).step);
+
+        // The x86 share gate: the guest mounts a writable virtio-fs share, reads a host file and writes
+        // one the host then sees on disk. Needs `-Dkernel=` a kernel with virtio-mmio + FUSE + virtio-fs
+        // built in; skips otherwise. Its own step so `zig build test` needs no x86 kernel.
+        const x86share_tests = b.addTest(.{
+            .name = "x86share",
+            .root_module = x86boot_module,
+            .filters = &.{"reads and writes a shared"},
+        });
+        b.step("test-x86share", "Boot a real x86 kernel and read and write a shared host directory under KVM")
+            .dependOn(&b.addRunArtifact(x86share_tests).step);
 
         // Stops a guest, moves it to a machine that has never run, and lets it carry on. Its own
         // target because it needs a kernel and because what it proves is separate.

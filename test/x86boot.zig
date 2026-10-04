@@ -15,6 +15,7 @@ const attest = @import("mirage-attest");
 const Manifest = attest.Manifest;
 const image = @import("mirage-image");
 const netmod = @import("mirage-net");
+const fsmod = @import("mirage-fs");
 const linux = std.os.linux;
 
 /// The guest userspace, built for x86_64 by the same `zig build` as the VMM. Unpacked
@@ -69,6 +70,18 @@ const tpm_addr = 0xfed4_0000;
 
 /// The register a launch is folded into, the one the host extends and the guest reads back.
 const launch_register = 0;
+
+/// The shared-fs device slot. The guest mounts the virtio-fs tag and reads and writes files the host
+/// serves from a real directory, over this window and interrupt.
+const fs_addr = 0xd000_0800;
+const fs_intid = 20;
+
+/// Answer one FUSE message by handing it to the Export the ctx points at. The Fs device's poll calls
+/// this as it drains the request queue.
+fn answerShare(ctx: *anyopaque, request: []const u8, into: []u8) usize {
+    const one: *fsmod.Export = @ptrCast(@alignCast(ctx));
+    return one.answer(request, into);
+}
 
 /// The address the guest answers to, and the port both sides agreed on. The guest-init holds the
 /// same two numbers, and a channel where one side disagrees is a channel nobody answers.
@@ -1236,4 +1249,170 @@ test "an x86 guest proves its launch chain through a tpm" {
     // Full parity: the guest read the measurement log the boot path left it through the TPM2 table
     // and folded it to the same register, so it can account for what started it rather than be told.
     try std.testing.expect(std.mem.indexOf(u8, log, "account: the list folds to the register") != null);
+}
+
+test "an x86 guest reads and writes a shared host directory" {
+    if (@import("builtin").cpu.arch != .x86_64) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+
+    const kernel = (try mapKernel()) orelse return error.SkipZigTest;
+    defer std.posix.munmap(kernel);
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // A host directory to share: a read-only `store` with a file, and a writable `work` the guest
+    // writes into. Built with raw syscalls because std.fs.cwd is unavailable in this build.
+    var dir_buf: [128:0]u8 = undefined;
+    const dir = std.fmt.bufPrintZ(&dir_buf, "/tmp/mirage-x86share-{d}-{d}", .{ linux.getpid(), nowMs() }) catch return error.SkipZigTest;
+    var store_buf: [160:0]u8 = undefined;
+    const store = std.fmt.bufPrintZ(&store_buf, "{s}/store", .{dir}) catch return error.SkipZigTest;
+    var work_buf: [160:0]u8 = undefined;
+    const work = std.fmt.bufPrintZ(&work_buf, "{s}/work", .{dir}) catch return error.SkipZigTest;
+    _ = linux.mkdir(dir, 0o755);
+    _ = linux.mkdir(store, 0o755);
+    _ = linux.mkdir(work, 0o755);
+    {
+        var hello_buf: [200:0]u8 = undefined;
+        const hello = std.fmt.bufPrintZ(&hello_buf, "{s}/hello", .{store}) catch return error.SkipZigTest;
+        const fd = linux.open(hello, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+        if (@as(isize, @bitCast(fd)) < 0) return error.SkipZigTest;
+        const content = "a store path from the host\n";
+        _ = linux.write(@intCast(fd), content, content.len);
+        _ = linux.close(@intCast(fd));
+    }
+
+    var exported = try fsmod.Export.init(gpa, io);
+    defer exported.deinit();
+    try exported.offer("store", store, false);
+    try exported.offer("work", work, true);
+
+    const asked = try gpa.alloc(u8, device.virtio.Fs.buffer_size);
+    defer gpa.free(asked);
+    const answered = try gpa.alloc(u8, device.virtio.Fs.buffer_size);
+    defer gpa.free(answered);
+    var shared_fs: device.virtio.Fs = undefined;
+    shared_fs.init(fsmod.Export.tag, .{ .ctx = &exported, .answer = answerShare }, asked, answered);
+
+    var machine = backend.kvm.Machine.create(gpa, 1) catch |err| switch (err) {
+        error.NoKvm => return error.SkipZigTest,
+        else => return err,
+    };
+    defer machine.deinit();
+
+    const region = try machine.vm.addMemory(ram_base, ram_size, .shared);
+    var regions = [_]GuestMemory.Region{region};
+    var memory: GuestMemory = .{ .regions = &regions };
+
+    const hv = machine.backend();
+    const id = try hv.addVcpu();
+
+    var controller = try backend.platform.createController(&machine.vm, 1);
+    defer controller.deinit();
+    const line = backend.platform.controllerLine(&controller);
+
+    var manifest: Manifest = .{};
+    defer manifest.deinit(gpa);
+
+    var archive: image.Cpio = .init(gpa);
+    defer archive.deinit();
+    try archive.addDirectory("dev", 0o755);
+    try archive.addCharacterDevice("dev/console", 0o600, 5, 1);
+    try archive.addFile("init", 0o755, guest_init);
+    const initrd = try archive.finish();
+    defer gpa.free(initrd);
+
+    const layout = try core.Launch.prepare(gpa, &memory, &manifest, .{
+        .kernel = kernel,
+        .initrd = initrd,
+        .cmdline = "console=ttyS0 earlyprintk=serial,ttyS0 panic=-1 rdinit=/init",
+        .ram_base = ram_base,
+        .ram_size = ram_size,
+        .cpus = 1,
+        .uart_base = serial_port,
+        // The one declared virtio device is the shared-fs at platform.fs (gsi 20).
+        .share = true,
+        .block_device = false,
+    });
+
+    const output = try gpa.alloc(u8, 256 << 10);
+    defer gpa.free(output);
+    var sink = std.Io.Writer.fixed(output);
+    var serial: device.Uart16550 = .{ .sink = &sink };
+    var acpi_shutdown: device.AcpiShutdown = .{ .slp_typ = acpi.s5_slp_typ };
+
+    var port_devices = [_]device.Bus.Device{ serial.device(serial_port), acpi_shutdown.device(acpi.sleep_port) };
+    var ports: device.Bus = .{ .devices = &port_devices };
+    var mmio_devices = [_]device.Bus.Device{shared_fs.device(fs_addr)};
+    var bus: device.Bus = .{ .devices = &mmio_devices };
+
+    var services = [_]device.Service{ serial.service(serial_irq), shared_fs.service(fs_intid) };
+
+    try arch.boot.enter(&machine.vcpus[id], layout);
+
+    const deadline = nowMs() + 20_000;
+    armTicks(10);
+
+    var exits: usize = 0;
+    while (exits < max_exits) : (exits += 1) {
+        if (exits % 1024 == 0 and nowMs() > deadline) {
+            std.debug.print("\n=== deadline after {d} exits ===\n", .{exits});
+            break;
+        }
+
+        const exit = hv.run(id) catch |err| {
+            std.debug.print("\nrun failed after {d} exits: {t}, kvm said {?}\n", .{ exits, err, machine.fault });
+            break;
+        };
+
+        switch (exit) {
+            .port_out => |w| ports.write(w.port, w.size, w.value),
+            .port_in => |r| try hv.completeMmioRead(id, ports.read(r.port, r.size)),
+            .mmio_write => |w| bus.write(w.gpa, w.size, w.value),
+            .mmio_read => |r| try hv.completeMmioRead(id, bus.read(r.gpa, r.size)),
+            .interrupted => {},
+            else => break,
+        }
+
+        // The Fs device's poll drains the request queue and answers each message through the Export.
+        try core.Launch.poll(services[0..services.len], &memory, line);
+
+        if (acpi_shutdown.requested) break;
+
+        if (sink.buffered().len + 512 > output.len) break;
+    }
+
+    const log = sink.buffered();
+
+    if (shared_fs.told == 0) {
+        std.debug.print(
+            "\n=== after {d} exits, told 0 ===\n{s}\n=== end ===\n",
+            .{ exits, log },
+        );
+        std.debug.print(
+            "\nnote: the guest did not use the shared-fs. This gate needs -Dkernel= a kernel with " ++
+                "virtio-mmio + FUSE + virtio-fs built in; skipping. See the B2b-2c memory.\n",
+            .{},
+        );
+        return error.SkipZigTest;
+    }
+
+    // The Export did real work for the guest: names looked up, nothing turned away, and at least one
+    // file created on the writable offer.
+    try std.testing.expect(exported.named > 0);
+    try std.testing.expectEqual(@as(u64, 0), exported.turned_away);
+    try std.testing.expect(exported.made > 0);
+
+    // The writable round trip: the guest wrote a file through virtio-fs, and the host reads the same
+    // bytes back off its own disk. Nothing in the guest reached the host except through the device.
+    var made_buf: [200:0]u8 = undefined;
+    const made = std.fmt.bufPrintZ(&made_buf, "{s}/made-inside", .{work}) catch return error.TestUnexpectedResult;
+    const rfd = linux.open(made, .{}, 0);
+    try std.testing.expect(@as(isize, @bitCast(rfd)) >= 0);
+    defer _ = linux.close(@intCast(rfd));
+    var readback: [64]u8 = undefined;
+    const got = linux.read(@intCast(rfd), &readback, readback.len);
+    try std.testing.expectEqualSlices(u8, "written by the guest\n", readback[0..@intCast(got)]);
 }
