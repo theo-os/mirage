@@ -36,6 +36,7 @@ const sev_cmd_id = struct {
     const init2: u32 = 22;
     const launch_start: u32 = 2;
     const launch_update_data: u32 = 3;
+    const launch_update_vmsa: u32 = 4;
     const launch_measure: u32 = 6;
     const launch_finish: u32 = 7;
 };
@@ -234,6 +235,12 @@ pub fn launchMeasure(self: *Vm, buf: []u8) Error![]u8 {
 
 pub fn launchFinish(self: *Vm) Error!void {
     try self.sevCmd(sev_cmd_id.launch_finish, 0, 0);
+}
+
+/// Seal every vCPU VMSA for a SEV-ES guest. The kernel reuses the /dev/sev fd
+/// remembered from launchStart, so no fd is passed here.
+pub fn launchUpdateVmsa(self: *Vm) Error!void {
+    try self.sevCmd(sev_cmd_id.launch_update_vmsa, 0, 0);
 }
 
 pub fn deinit(self: *Vm) void {

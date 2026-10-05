@@ -60,6 +60,16 @@ pub fn createSev(gpa: std.mem.Allocator, cpus: u32) Error!Machine {
     return init(gpa, cpus, vm);
 }
 
+/// Make a SEV-ES machine. The VM is opened as KVM_X86_SEV_ES_VM (type 3), SEV_INIT2 runs,
+/// then the in-kernel irqchip is built, all before any vCPU or memory slot is added.
+pub fn createSevEs(gpa: std.mem.Allocator, cpus: u32) Error!Machine {
+    var vm = try Vm.createWithType(3);
+    errdefer vm.deinit();
+    try vm.sevInit2();
+    try vm.createIrqchip();
+    return init(gpa, cpus, vm);
+}
+
 pub fn sevSeal(self: *Machine, region: Backend.GuestMemory.Region, measure: []u8) Error!?[]const u8 {
     std.debug.assert(region.backing == .shared);
     const uaddr = @intFromPtr(region.backing.shared.ptr);
@@ -255,4 +265,18 @@ test "a guest prints through the backend interface, not through kvm directly" {
     }
 
     try testing.expectEqualSlices(u8, "hi", sink.buffered());
+}
+
+test "a sev-es vm initialises as the normal user" {
+    if (comptime builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var machine = Machine.createSevEs(testing.allocator(), 1) catch |err| switch (err) {
+        error.NoKvm,
+        error.NotSupported,
+        error.PermissionDenied,
+        error.InvalidArgument,
+        error.SevFirmwareError,
+        => return error.SkipZigTest,
+        else => return err,
+    };
+    defer machine.deinit();
 }
