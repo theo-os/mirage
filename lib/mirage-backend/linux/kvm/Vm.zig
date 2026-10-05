@@ -111,6 +111,9 @@ kvm: std.posix.fd_t,
 fd: std.posix.fd_t,
 slots: u32 = 0,
 owned: [max_slots]Slot = @splat(.{}),
+/// True for a SEV-ES VM (type 3). The guest cannot manage the CET supervisor xstate under
+/// encrypted state, so its CPUID must not advertise it. See the leaf 0xD filter in the vcpu.
+sev_es: bool = false,
 
 pub fn create() Error!Vm {
     return createWithType(0);
@@ -137,7 +140,7 @@ pub fn createWithType(vm_type: u64) Error!Vm {
         if (vm_type == 0) try installIrqchip(vm_fd);
     }
 
-    return .{ .kvm = kvm, .fd = vm_fd };
+    return .{ .kvm = kvm, .fd = vm_fd, .sev_es = vm_type == 3 };
 }
 
 /// Build the in-kernel PIC, IOAPIC, and PIT. x86 only, and before any vcpu exists.

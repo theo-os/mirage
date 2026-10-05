@@ -270,7 +270,7 @@ pub fn create(vm: *Vm, index: u32) Error!Vcpu {
     );
     errdefer std.posix.munmap(mapping);
 
-    try loadCpuid(vm.kvm, fd);
+    try loadCpuid(vm.kvm, fd, vm.sev_es);
     try enterFlatMode(fd);
 
     return .{ .fd = fd, .mapping = mapping, .state = @ptrCast(@alignCast(mapping.ptr)) };
@@ -280,7 +280,7 @@ pub fn create(vm: *Vm, index: u32) Error!Vcpu {
 ///
 /// The ioctl number encodes the header size only, because `entries` is a C flexible array.
 /// The kernel reads and writes past the header on purpose.
-fn loadCpuid(kvm_fd: std.posix.fd_t, vcpu_fd: std.posix.fd_t) Error!void {
+fn loadCpuid(kvm_fd: std.posix.fd_t, vcpu_fd: std.posix.fd_t, sev_es: bool) Error!void {
     var buf: Cpuid2Buffer = .{
         .header = .{ .nent = max_cpuid_entries, .padding = 0 },
         .entries = undefined,
@@ -298,6 +298,8 @@ fn loadCpuid(kvm_fd: std.posix.fd_t, vcpu_fd: std.posix.fd_t) Error!void {
         else => return err,
     };
 
+    if (sev_es) hideCetXstate(buf.entries[0..buf.header.nent]);
+
     // The ioctl number is built from the 8-byte header type on purpose; the pointer is the
     // full buffer. The entries the read filled in follow the header the kernel reads back.
     _ = try ioctl.call(
@@ -305,6 +307,37 @@ fn loadCpuid(kvm_fd: std.posix.fd_t, vcpu_fd: std.posix.fd_t) Error!void {
         comptime ioctl.request(.write, Cpuid2Header, nr.set_cpuid2),
         @intFromPtr(&buf),
     );
+}
+
+/// The CET shadow stack xstate components in CPUID leaf 0xD. They are supervisor states managed
+/// through IA32_XSS, which a SEV-ES guest kernel does not enable, so it leaves them out of its
+/// xstate size while the host leaf still counts them. That size disagreement makes the guest
+/// disable XSAVE and fault in early boot, so the launch presents the leaf without them.
+const cet_u_bit = 11;
+const cet_s_bit = 12;
+const cet_xss_mask: u32 = (1 << cet_u_bit) | (1 << cet_s_bit);
+
+/// Clear the CET supervisor components from CPUID leaf 0xD so a SEV-ES guest sees an xstate size
+/// it agrees with. Sub-leaf 1 holds the supervisor mask in ecx; the per-component sub-leaves 11
+/// and 12 describe their size and offset and are zeroed with them.
+fn hideCetXstate(entries: []CpuidEntry2) void {
+    for (entries) |*entry| {
+        if (entry.function != 0xD) continue;
+        switch (entry.index) {
+            1 => entry.ecx &= ~cet_xss_mask,
+            cet_u_bit, cet_s_bit => entry.* = .{
+                .function = 0xD,
+                .index = entry.index,
+                .flags = entry.flags,
+                .eax = 0,
+                .ebx = 0,
+                .ecx = 0,
+                .edx = 0,
+                .padding = .{ 0, 0, 0 },
+            },
+            else => {},
+        }
+    }
 }
 
 /// A flat code segment: base 0, 4G limit, 32-bit, present, executable/readable.

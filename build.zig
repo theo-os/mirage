@@ -479,10 +479,21 @@ pub fn build(b: *std.Build) void {
         const x86sev_tests = b.addTest(.{
             .name = "x86sev",
             .root_module = x86boot_module,
-            .filters = &.{"boots encrypted under sev"},
+            .filters = &.{"boots encrypted under sev and"},
         });
         b.step("test-x86sev", "Boot a real x86 kernel with its memory encrypted under SEV through KVM")
             .dependOn(&b.addRunArtifact(x86sev_tests).step);
+
+        // The x86 SEV-ES gate: the guest boots with both its memory and its vCPU VMSA encrypted, reaching
+        // userspace over its GHCB-mediated serial. Root only (needs the /dev/sev fd); skips as the
+        // normal user. Needs `-Dkernel=` a bootable x86 kernel with AMD_MEM_ENCRYPT.
+        const x86seves_tests = b.addTest(.{
+            .name = "x86seves",
+            .root_module = x86boot_module,
+            .filters = &.{"boots encrypted under sev-es"},
+        });
+        b.step("test-x86seves", "Boot a real x86 kernel with memory and vCPU state encrypted under SEV-ES through KVM")
+            .dependOn(&b.addRunArtifact(x86seves_tests).step);
 
         // Stops a guest, moves it to a machine that has never run, and lets it carry on. Its own
         // target because it needs a kernel and because what it proves is separate.
