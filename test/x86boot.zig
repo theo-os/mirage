@@ -689,6 +689,185 @@ test "a real x86 kernel boots encrypted under sev-es and stops cleanly" {
     try std.testing.expect(powered_off);
 }
 
+test "a real x86 kernel verifies its launch measurement under sev" {
+    // Only an x86 host can build the page tables and run the bzImage this gate maps.
+    if (@import("builtin").cpu.arch != .x86_64) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+    const sev_host = backend.kvm.sev_host;
+    const sev_cert = backend.kvm.sev_cert;
+    const sev_session = backend.kvm.sev_session;
+
+    const report = backend.kvm.probe.host() catch |err| switch (err) {
+        error.NoKvm => return error.SkipZigTest,
+        else => return err,
+    };
+    if (!report.sev) return error.SkipZigTest;
+
+    const kernel = (try mapKernel()) orelse return error.SkipZigTest;
+    defer std.posix.munmap(kernel);
+
+    // The /dev/sev commands and the launch flow are root only. Run the gate as root; otherwise skip.
+    const sev_fd = backend.kvm.Vm.openSev() orelse return error.SkipZigTest;
+    defer _ = linux.close(sev_fd);
+
+    // The guest owner side: ask the platform for its firmware version and its PDH key.
+    const plat = sev_host.platformStatus(sev_fd) catch return error.SkipZigTest;
+    var pdh_buf: [4096]u8 = undefined;
+    var chain_buf: [8192]u8 = undefined;
+    const exported = sev_host.pdhCertExport(sev_fd, &pdh_buf, &chain_buf) catch return error.SkipZigTest;
+    const platform_pdh = sev_cert.parsePdh(exported.pdh) catch return error.SkipZigTest;
+
+    // The guest owner's ephemeral key material. Fixed here so the gate is reproducible; the launch is
+    // a self test, not a confidential channel to a third party.
+    const priv: [48]u8 = blk: {
+        var s: [48]u8 = @splat(0);
+        s[47] = 0x42;
+        break :blk s;
+    };
+    const nonce: [16]u8 = @splat(0x11);
+    const iv: [16]u8 = @splat(0x22);
+    const tek: [16]u8 = @splat(0x33);
+    const tik: [16]u8 = @splat(0x44);
+    const policy: u32 = 0;
+
+    const go_pub = sev_session.publicPoint(priv) catch return error.SkipZigTest;
+    var cert_buf: [2084]u8 = undefined;
+    sev_cert.buildGuestOwner(go_pub, plat.api_major, plat.api_minor, &cert_buf);
+
+    const shared = sev_session.ecdhSharedX(priv, platform_pdh) catch return error.SkipZigTest;
+    const keys = sev_session.deriveKeys(shared, nonce);
+    const session = sev_session.buildSession(.{
+        .kek = keys.kek,
+        .kik = keys.kik,
+        .tek = tek,
+        .tik = tik,
+        .nonce = nonce,
+        .iv = iv,
+        .policy = policy,
+    });
+
+    var machine = backend.kvm.Machine.createSev(gpa, 1) catch |err| switch (err) {
+        error.NoKvm, error.SevFirmwareError, error.NotSupported, error.PermissionDenied, error.InvalidArgument => return error.SkipZigTest,
+        else => return err,
+    };
+    defer machine.deinit();
+
+    const region = try machine.vm.addMemory(ram_base, ram_size, .shared);
+    var regions = [_]GuestMemory.Region{region};
+    var memory: GuestMemory = .{ .regions = &regions };
+
+    const hv = machine.backend();
+    const id = try hv.addVcpu();
+
+    var manifest: Manifest = .{};
+    defer manifest.deinit(gpa);
+
+    var archive: image.Cpio = .init(gpa);
+    defer archive.deinit();
+    try archive.addDirectory("dev", 0o755);
+    try archive.addCharacterDevice("dev/console", 0o600, 5, 1);
+    try archive.addFile("init", 0o755, guest_init);
+    const initrd = try archive.finish();
+    defer gpa.free(initrd);
+
+    // The launch starts on the empty guest, carrying the guest owner's DH cert and session so the
+    // firmware uses our transport keys. A rejected session means a cert, KDF, or session byte is wrong.
+    machine.vm.launchStartAttested(policy, sev_fd, &cert_buf, &session) catch |err| {
+        std.debug.print("\n=== sevattest: launch start {t}, sev_error {d} (SEV_RET) ===\n", .{ err, machine.vm.sev_error });
+        return err;
+    };
+
+    const c_bit = arch.platform.hostCBit();
+    const layout = try core.Launch.prepare(gpa, &memory, &manifest, .{
+        .kernel = kernel,
+        .initrd = initrd,
+        .cmdline = "console=ttyS0 earlyprintk=serial,ttyS0 panic=-1 rdinit=/init",
+        .ram_base = ram_base,
+        .ram_size = ram_size,
+        .cpus = 1,
+        .uart_base = serial_port,
+        .block_device = false,
+        .sev_c_bit = c_bit,
+    });
+
+    // The launch digest is the SHA-256 of the exact bytes the firmware encrypts, taken from the
+    // plaintext before UPDATE_DATA. The covered range is settled against the firmware's measurement.
+    const digest = sev_session.launchDigest(region.backing.shared);
+    try machine.sevUpdateData(region);
+
+    var measure_buf: [64]u8 = undefined;
+    const blob = try machine.vm.launchMeasure(&measure_buf);
+    if (blob.len < 48) {
+        std.debug.print("\n=== sevattest: measure blob {d} bytes, expected 48 ===\n", .{blob.len});
+        return error.SkipZigTest;
+    }
+
+    const measurement: [32]u8 = blob[0..32].*;
+    const m_nonce: [16]u8 = blob[32..48].*;
+    const ok = sev_session.verifyMeasurement(.{
+        .tik = tik,
+        .api_major = plat.api_major,
+        .api_minor = plat.api_minor,
+        .build_id = plat.build,
+        .policy = policy,
+        .digest = digest,
+        .m_nonce = m_nonce,
+    }, measurement);
+    if (!ok) {
+        std.debug.print(
+            "\n=== sevattest: measurement mismatch. api {d}.{d} build {d}, c_bit {d} ===\nfirmware: {x}\nld: {x}\n=== end ===\n",
+            .{ plat.api_major, plat.api_minor, plat.build, c_bit, measurement, digest },
+        );
+    }
+    try std.testing.expect(ok);
+
+    try machine.vm.launchFinish();
+
+    const output = try gpa.alloc(u8, 256 << 10);
+    defer gpa.free(output);
+    var sink = std.Io.Writer.fixed(output);
+    var serial: device.Uart16550 = .{ .sink = &sink };
+
+    var acpi_shutdown: device.AcpiShutdown = .{ .slp_typ = acpi.s5_slp_typ };
+
+    var port_devices = [_]device.Bus.Device{ serial.device(serial_port), acpi_shutdown.device(acpi.sleep_port) };
+    var ports: device.Bus = .{ .devices = &port_devices };
+    var devices: [0]device.Bus.Device = undefined;
+    var bus: device.Bus = .{ .devices = &devices };
+
+    try arch.boot.enter(&machine.vcpus[id], layout);
+
+    const deadline = nowMs() + 30_000;
+    armTicks(10);
+
+    var exits: usize = 0;
+    var powered_off = false;
+    while (exits < max_exits) : (exits += 1) {
+        if (exits % 1024 == 0 and nowMs() > deadline) break;
+        try machine.vm.setIrq(serial_irq, serial.signalling());
+        const exit = hv.run(id) catch break;
+        switch (exit) {
+            .port_out => |w| ports.write(w.port, w.size, w.value),
+            .port_in => |r| try hv.completeMmioRead(id, ports.read(r.port, r.size)),
+            .mmio_write => |w| bus.write(w.gpa, w.size, w.value),
+            .mmio_read => |r| try hv.completeMmioRead(id, bus.read(r.gpa, r.size)),
+            .interrupted => {},
+            else => break,
+        }
+        if (acpi_shutdown.requested) {
+            powered_off = true;
+            break;
+        }
+        if (sink.buffered().len + 512 > output.len) break;
+    }
+
+    // The attested guest booted and stopped: the verified measurement proves it ran exactly the
+    // kernel and structures the guest owner loaded.
+    try std.testing.expect(std.mem.indexOf(u8, sink.buffered(), alive) != null);
+    try std.testing.expect(powered_off);
+}
+
 /// The guest-init prints this once it has opened the channel back to this process. Seeing it is proof
 /// the kernel bound the virtio-mmio driver to the ACPI device, the vsock driver probed, and the
 /// guest reached the port this process listens on.

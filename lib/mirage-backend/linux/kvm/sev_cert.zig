@@ -7,20 +7,24 @@
 const std = @import("std");
 const P384 = std.crypto.ecc.P384;
 
-// sev_cert field offsets and sizes (sevapi.h, __packed, 1568 bytes total).
+// sev_cert field offsets and sizes (sevapi.h, __packed, 2084 bytes total). The pub_key is a union
+// whose largest member is the RSA-4096 key (4 + 512 + 512 = 1028 bytes), so the field is 1028 even
+// when it holds an ECDH key; the sig fields are 512 (the ECDSA sig is smaller, padded).
+const cert_pub_key_size: usize = 1028;
+const cert_sig_size: usize = 512;
 const cert_version_off: usize = 0;
 const cert_api_major_off: usize = 4;
 const cert_api_minor_off: usize = 5;
 const cert_pub_key_usage_off: usize = 8;
 const cert_pub_key_algo_off: usize = 12;
 const cert_pub_key_off: usize = 16;
-const cert_sig1_usage_off: usize = 528;
-const cert_sig1_algo_off: usize = 532;
-const cert_sig2_usage_off: usize = 1048;
-const cert_sig2_algo_off: usize = 1052;
-const cert_total: usize = 1568;
+const cert_sig1_usage_off: usize = cert_pub_key_off + cert_pub_key_size; // 1044
+const cert_sig1_algo_off: usize = cert_sig1_usage_off + 4;
+const cert_sig2_usage_off: usize = cert_sig1_usage_off + 8 + cert_sig_size; // 1564
+const cert_sig2_algo_off: usize = cert_sig2_usage_off + 4;
+const cert_total: usize = cert_sig2_usage_off + 8 + cert_sig_size; // 2084
 
-// sev_ecdh_pub_key offsets within the 512-byte pub_key field.
+// sev_ecdh_pub_key offsets within the pub_key field.
 const ecdh_curve_off: usize = 0;
 const ecdh_qx_off: usize = 4;
 const ecdh_qy_off: usize = 76;
@@ -28,20 +32,21 @@ const ecdh_coord_field: usize = 72; // bytes per coordinate field
 const ecdh_coord_used: usize = 48; // P-384 uses the low 48 bytes of each field
 
 comptime {
-    // Offsets must be consistent: sig_1 starts at pub_key end (16 + 512 = 528).
-    std.debug.assert(cert_pub_key_off + 512 == cert_sig1_usage_off);
-    // sig_2 starts at sig_1 end (528 + 4 + 4 + 512 = 1048).
-    std.debug.assert(cert_sig1_usage_off + 4 + 4 + 512 == cert_sig2_usage_off);
-    // cert total: sig_2 end (1048 + 4 + 4 + 512 = 1568).
-    std.debug.assert(cert_sig2_usage_off + 4 + 4 + 512 == cert_total);
+    std.debug.assert(cert_pub_key_off + cert_pub_key_size == cert_sig1_usage_off);
+    std.debug.assert(cert_sig1_usage_off + 4 + 4 + cert_sig_size == cert_sig2_usage_off);
+    std.debug.assert(cert_total == 2084);
     // qy follows qx: 4 + 72 = 76.
     std.debug.assert(ecdh_qx_off + ecdh_coord_field == ecdh_qy_off);
 }
 
 // SEV usage and algorithm enum values.
 const usage_pdh: u32 = 0x1003;
+const usage_pek: u32 = 0x1002;
 const usage_invalid: u32 = 0x1000;
-const algo_ecdh_sha384: u32 = 0x103;
+const algo_ecdsa_sha256: u32 = 0x2;
+// The guest-owner DH key declares ECDH_SHA256, as sev-tool's create_godh_cert does. SEV keys its
+// derivations off SHA-256, and the firmware rejects the cert (INVALID_CERTIFICATE) with ECDH_SHA384.
+const algo_ecdh_sha256: u32 = 0x3;
 const curve_p384: u32 = 2;
 
 pub const Error = error{
@@ -64,7 +69,7 @@ pub fn parsePdh(blob: []const u8) Error!P384 {
     const usage = std.mem.readInt(u32, blob[cert_pub_key_usage_off..][0..4], .little);
     if (usage != usage_pdh) return error.NotPdhUsage;
 
-    const pk = blob[cert_pub_key_off..][0..512];
+    const pk = blob[cert_pub_key_off..][0..cert_pub_key_size];
     const curve = std.mem.readInt(u32, pk[ecdh_curve_off..][0..4], .little);
     if (curve != curve_p384) return error.NotP384Curve;
 
@@ -104,23 +109,27 @@ pub fn buildGuestOwner(point: P384, api_major: u8, api_minor: u8, into: *[cert_t
     into[cert_api_major_off] = api_major;
     into[cert_api_minor_off] = api_minor;
     std.mem.writeInt(u32, into[cert_pub_key_usage_off..][0..4], usage_pdh, .little);
-    std.mem.writeInt(u32, into[cert_pub_key_algo_off..][0..4], algo_ecdh_sha384, .little);
+    std.mem.writeInt(u32, into[cert_pub_key_algo_off..][0..4], algo_ecdh_sha256, .little);
 
-    const pk = into[cert_pub_key_off..][0..512];
+    const pk = into[cert_pub_key_off..][0..cert_pub_key_size];
     std.mem.writeInt(u32, pk[ecdh_curve_off..][0..4], curve_p384, .little);
     pk[ecdh_qx_off..][0..ecdh_coord_used].* = x_le;
     pk[ecdh_qy_off..][0..ecdh_coord_used].* = y_le;
 
-    std.mem.writeInt(u32, into[cert_sig1_usage_off..][0..4], usage_invalid, .little);
+    // sev-tool self-signs the GODH cert with its own key and declares sig_1 as PEK/ECDSA_SHA256.
+    // The firmware does not validate the GODH signature, so the signature bytes stay zero; the usage
+    // and algo fields are set to match a well-formed cert. sig_2 is unused.
+    std.mem.writeInt(u32, into[cert_sig1_usage_off..][0..4], usage_pek, .little);
+    std.mem.writeInt(u32, into[cert_sig1_algo_off..][0..4], algo_ecdsa_sha256, .little);
     std.mem.writeInt(u32, into[cert_sig2_usage_off..][0..4], usage_invalid, .little);
 }
 
-test "comptime layout constants are consistent with the 1568-byte cert" {
+test "comptime layout constants are consistent with the 2084-byte cert" {
     comptime {
-        std.debug.assert(cert_total == 1568);
+        std.debug.assert(cert_total == 2084);
         std.debug.assert(cert_pub_key_off == 16);
-        std.debug.assert(cert_sig1_usage_off == 528);
-        std.debug.assert(cert_sig2_usage_off == 1048);
+        std.debug.assert(cert_sig1_usage_off == 1044);
+        std.debug.assert(cert_sig2_usage_off == 1564);
     }
 }
 

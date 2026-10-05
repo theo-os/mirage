@@ -115,6 +115,9 @@ owned: [max_slots]Slot = @splat(.{}),
 /// True for a SEV-ES VM (type 3). The guest cannot manage the CET supervisor xstate under
 /// encrypted state, so its CPUID must not advertise it. See the leaf 0xD filter in the vcpu.
 sev_es: bool = false,
+/// The firmware error code behind the last SevFirmwareError, kept rather than discarded so a
+/// rejected command says why (the SEV_RET code).
+sev_error: u32 = 0,
 
 pub fn create() Error!Vm {
     return createWithType(0);
@@ -169,7 +172,10 @@ fn sevCmd(self: *Vm, id: u32, data: u64, sev_fd: u32) Error!void {
     // The kernel reports a PSP firmware error by setting cmd.error and failing the ioctl, as a rule
     // with EIO. The firmware code takes priority over the generic errno, and the kernel still writes
     // any output the command produced, such as a measurement length, back into the argument struct.
-    if (cmd.@"error" != 0) return Error.SevFirmwareError;
+    if (cmd.@"error" != 0) {
+        self.sev_error = cmd.@"error";
+        return Error.SevFirmwareError;
+    }
     return switch (std.posix.errno(rc)) {
         .SUCCESS => {},
         .PERM, .ACCES => Error.PermissionDenied,

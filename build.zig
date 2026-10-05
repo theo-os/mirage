@@ -495,6 +495,17 @@ pub fn build(b: *std.Build) void {
         b.step("test-x86seves", "Boot a real x86 kernel with memory and vCPU state encrypted under SEV-ES through KVM")
             .dependOn(&b.addRunArtifact(x86seves_tests).step);
 
+        // The x86 SEV attestation gate: the guest owner establishes transport keys through the
+        // platform and verifies the launch measurement under its own TIK. Root only (needs /dev/sev);
+        // skips as the normal user. Needs `-Dkernel=` a bootable x86 kernel.
+        const x86sevattest_tests = b.addTest(.{
+            .name = "x86sevattest",
+            .root_module = x86boot_module,
+            .filters = &.{"verifies its launch measurement under sev"},
+        });
+        b.step("test-x86sevattest", "Verify the SEV launch measurement of a real x86 guest through KVM")
+            .dependOn(&b.addRunArtifact(x86sevattest_tests).step);
+
         // Stops a guest, moves it to a machine that has never run, and lets it carry on. Its own
         // target because it needs a kernel and because what it proves is separate.
         const snapshot_module = b.createModule(.{
