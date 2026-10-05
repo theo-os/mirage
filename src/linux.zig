@@ -435,10 +435,20 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         .share = options.share_count > 0,
     };
 
+    // The LAUNCH commands issue through this /dev/sev fd, held open from start through finish.
+    var sev_dev: ?std.posix.fd_t = null;
+    defer if (sev_dev) |fd| {
+        _ = std.os.linux.close(fd);
+    };
+
     if (comptime @import("builtin").cpu.arch == .x86_64) {
         if (came_back == null and options.sev) {
+            sev_dev = backend.kvm.Vm.openSev() orelse {
+                try out.print("sev needs /dev/sev, which this user cannot open\n", .{});
+                return error.SevUnavailable;
+            };
             launch_config.sev_c_bit = arch.platform.hostCBit();
-            try machine.vm.launchStart(options.sev_policy);
+            try machine.vm.launchStart(options.sev_policy, sev_dev.?);
         }
     }
 

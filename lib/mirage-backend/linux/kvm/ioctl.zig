@@ -82,7 +82,9 @@ pub const KvmSevCmd = extern struct {
     pad0: u32 = 0,
     data: u64,
     @"error": u32 = 0,
-    pad1: u32 = 0,
+    /// The LAUNCH commands issue through a /dev/sev file descriptor the caller opens and passes here.
+    /// INIT2 brokers the platform in the kernel and leaves this zero.
+    sev_fd: u32 = 0,
 
     comptime {
         std.debug.assert(@sizeOf(KvmSevCmd) == 24);

@@ -50,12 +50,13 @@ pub fn create(gpa: std.mem.Allocator, cpus: u32) Error!Machine {
     return init(gpa, cpus, vm);
 }
 
-/// Make a SEV machine. The VM is opened as KVM_X86_SEV_VM (type 2) and SEV_INIT2 is called
-/// before any vCPU or memory slot is added.
+/// Make a SEV machine. The VM is opened as KVM_X86_SEV_VM (type 2), SEV_INIT2 runs, then the
+/// in-kernel irqchip is built, all before any vCPU or memory slot is added.
 pub fn createSev(gpa: std.mem.Allocator, cpus: u32) Error!Machine {
     var vm = try Vm.createWithType(2);
     errdefer vm.deinit();
     try vm.sevInit2();
+    try vm.createIrqchip();
     return init(gpa, cpus, vm);
 }
 

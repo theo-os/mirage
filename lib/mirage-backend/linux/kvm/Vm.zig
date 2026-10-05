@@ -130,31 +130,58 @@ pub fn createWithType(vm_type: u64) Error!Vm {
     // On x86 the in-kernel PIC, IOAPIC, and per-vcpu LAPIC are built here, before
     // any vcpu exists. The kernel requires that order. On arm the GIC fills this
     // role and is created separately via Gic.zig; nothing changes on that path.
-    // A SEV VM (type 2) must not create the in-kernel irqchip or PIT here;
-    // those are set up after sevInit2 and launchFinish.
+    // A SEV VM (type 2) builds the same irqchip, but after sevInit2, so the SEV
+    // path calls installIrqchip itself once init is done.
     if (comptime builtin.cpu.arch == .x86_64) {
-        if (vm_type == 0) {
-            _ = try ioctl.call(vm_fd, comptime ioctl.request(.none, void, nr.create_irqchip), 0);
-
-            // The in-kernel timer the guest's clock needs. Without it the kernel reaches userspace but
-            // its timekeeping never advances, so the first process makes no progress. The LAPIC timer is
-            // not enough here: the kernel calibrates against this one first.
-            const pit: PitConfig = .{ .flags = 0, .pad = @splat(0) };
-            _ = try ioctl.call(vm_fd, comptime ioctl.request(.write, PitConfig, nr.create_pit2), @intFromPtr(&pit));
-        }
+        if (vm_type == 0) try installIrqchip(vm_fd);
     }
 
     return .{ .kvm = kvm, .fd = vm_fd };
 }
 
-fn sevCmd(self: *Vm, id: u32, data: u64) Error!void {
-    var cmd: ioctl.KvmSevCmd = .{ .id = id, .data = data };
-    _ = try ioctl.call(
-        self.fd,
-        comptime ioctl.request(.read_write, u64, nr.memory_encrypt_op),
-        @intFromPtr(&cmd),
-    );
+/// Build the in-kernel PIC, IOAPIC, and PIT. x86 only, and before any vcpu exists.
+fn installIrqchip(vm_fd: std.posix.fd_t) Error!void {
+    _ = try ioctl.call(vm_fd, comptime ioctl.request(.none, void, nr.create_irqchip), 0);
+
+    // The in-kernel timer the guest's clock needs. Without it the kernel reaches userspace but
+    // its timekeeping never advances, so the first process makes no progress. The LAPIC timer is
+    // not enough here: the kernel calibrates against this one first.
+    const pit: PitConfig = .{ .flags = 0, .pad = @splat(0) };
+    _ = try ioctl.call(vm_fd, comptime ioctl.request(.write, PitConfig, nr.create_pit2), @intFromPtr(&pit));
+}
+
+/// Build the x86 in-kernel irqchip and PIT for a SEV VM, after sevInit2 and before any vcpu.
+pub fn createIrqchip(self: *Vm) Error!void {
+    if (comptime builtin.cpu.arch != .x86_64) return;
+    try installIrqchip(self.fd);
+}
+
+fn sevCmd(self: *Vm, id: u32, data: u64, sev_fd: u32) Error!void {
+    var cmd: ioctl.KvmSevCmd = .{ .id = id, .data = data, .sev_fd = sev_fd };
+    const req = comptime ioctl.request(.read_write, u64, nr.memory_encrypt_op);
+    const rc = std.os.linux.ioctl(self.fd, req, @intFromPtr(&cmd));
+
+    // The kernel reports a PSP firmware error by setting cmd.error and failing the ioctl, as a rule
+    // with EIO. The firmware code takes priority over the generic errno, and the kernel still writes
+    // any output the command produced, such as a measurement length, back into the argument struct.
     if (cmd.@"error" != 0) return Error.SevFirmwareError;
+    return switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        .PERM, .ACCES => Error.PermissionDenied,
+        .BADF => Error.InvalidFileDescriptor,
+        .FAULT => Error.BadAddress,
+        .INVAL => Error.InvalidArgument,
+        .IO => Error.SevFirmwareError,
+        else => |e| std.posix.unexpectedErrno(e),
+    };
+}
+
+/// Open /dev/sev for the LAUNCH commands. It is root only, so this returns null when the caller
+/// cannot open it, which lets an unprivileged run skip the launch rather than fault.
+pub fn openSev() ?std.posix.fd_t {
+    const opened = linux.open("/dev/sev", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    if (std.posix.errno(opened) != .SUCCESS) return null;
+    return @intCast(opened);
 }
 
 pub fn sevInit2(self: *Vm) Error!void {
@@ -165,10 +192,12 @@ pub fn sevInit2(self: *Vm) Error!void {
         .pad1 = 0,
         .pad2 = @splat(0),
     };
-    try self.sevCmd(sev_cmd_id.init2, @intFromPtr(&args));
+    try self.sevCmd(sev_cmd_id.init2, @intFromPtr(&args), 0);
 }
 
-pub fn launchStart(self: *Vm, policy: u32) Error!void {
+/// Start the launch. The kernel remembers this sev_fd on the guest, so the update, measure, and
+/// finish commands reuse it and take no fd of their own.
+pub fn launchStart(self: *Vm, policy: u32, sev_fd: std.posix.fd_t) Error!void {
     var args: ioctl.KvmSevLaunchStart = .{
         .handle = 0,
         .policy = policy,
@@ -177,7 +206,7 @@ pub fn launchStart(self: *Vm, policy: u32) Error!void {
         .session_uaddr = 0,
         .session_len = 0,
     };
-    try self.sevCmd(sev_cmd_id.launch_start, @intFromPtr(&args));
+    try self.sevCmd(sev_cmd_id.launch_start, @intFromPtr(&args), @intCast(sev_fd));
 }
 
 pub fn launchUpdateData(self: *Vm, uaddr: u64, len: u64) Error!void {
@@ -185,21 +214,26 @@ pub fn launchUpdateData(self: *Vm, uaddr: u64, len: u64) Error!void {
         .uaddr = uaddr,
         .len = @intCast(len),
     };
-    try self.sevCmd(sev_cmd_id.launch_update_data, @intFromPtr(&args));
+    try self.sevCmd(sev_cmd_id.launch_update_data, @intFromPtr(&args), 0);
 }
 
 pub fn launchMeasure(self: *Vm, buf: []u8) Error![]u8 {
+    // A zero length queries the blob size. The firmware flags the empty buffer as an error but the
+    // kernel writes the needed length back first, so tolerate that one error and read the length.
     var args: ioctl.KvmSevLaunchMeasure = .{ .uaddr = 0, .len = 0 };
-    try self.sevCmd(sev_cmd_id.launch_measure, @intFromPtr(&args));
+    self.sevCmd(sev_cmd_id.launch_measure, @intFromPtr(&args), 0) catch |err| switch (err) {
+        error.SevFirmwareError => {},
+        else => return err,
+    };
     const needed = args.len;
     if (needed == 0 or needed > buf.len) return buf[0..0];
     args = .{ .uaddr = @intFromPtr(buf.ptr), .len = needed };
-    try self.sevCmd(sev_cmd_id.launch_measure, @intFromPtr(&args));
+    try self.sevCmd(sev_cmd_id.launch_measure, @intFromPtr(&args), 0);
     return buf[0..needed];
 }
 
 pub fn launchFinish(self: *Vm) Error!void {
-    try self.sevCmd(sev_cmd_id.launch_finish, 0);
+    try self.sevCmd(sev_cmd_id.launch_finish, 0, 0);
 }
 
 pub fn deinit(self: *Vm) void {

@@ -93,5 +93,11 @@ pub fn hostCBit() u6 {
         : [leaf] "{eax}" (@as(u32, 0x8000001F)),
           [sub] "{ecx}" (@as(u32, 0)),
     );
-    return @intCast(ebx & 0x3f);
+    const bit: u6 = @intCast(ebx & 0x3f);
+
+    // A SEV C-bit always sits high in the physical address, around 47 to 51. A zero or low value
+    // means the leaf is unsupported (not an AMD SEV host), and treating it as a page-table bit
+    // would corrupt the mapping. Only call this once SEV is confirmed.
+    std.debug.assert(bit >= 32);
+    return bit;
 }

@@ -473,6 +473,17 @@ pub fn build(b: *std.Build) void {
         b.step("test-x86share", "Boot a real x86 kernel and read and write a shared host directory under KVM")
             .dependOn(&b.addRunArtifact(x86share_tests).step);
 
+        // The x86 SEV gate: the guest boots with its memory encrypted through the KVM SEV launch flow
+        // and reaches userspace over its unencrypted serial port. Runs as the normal user; skips where
+        // the host KVM lacks SEV or the launch is refused. Needs `-Dkernel=` a bootable x86 kernel.
+        const x86sev_tests = b.addTest(.{
+            .name = "x86sev",
+            .root_module = x86boot_module,
+            .filters = &.{"boots encrypted under sev"},
+        });
+        b.step("test-x86sev", "Boot a real x86 kernel with its memory encrypted under SEV through KVM")
+            .dependOn(&b.addRunArtifact(x86sev_tests).step);
+
         // Stops a guest, moves it to a machine that has never run, and lets it carry on. Its own
         // target because it needs a kernel and because what it proves is separate.
         const snapshot_module = b.createModule(.{
