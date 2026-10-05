@@ -142,6 +142,23 @@ pub const KvmSevLaunchMeasure = extern struct {
     }
 };
 
+/// `kvm_sev_launch_secret` for `KVM_SEV_LAUNCH_SECRET`.
+pub const KvmSevLaunchSecret = extern struct {
+    hdr_uaddr: u64,
+    hdr_len: u32,
+    pad0: u32 = 0,
+    guest_uaddr: u64,
+    guest_len: u32,
+    pad1: u32 = 0,
+    trans_uaddr: u64,
+    trans_len: u32,
+    pad2: u32 = 0,
+
+    comptime {
+        std.debug.assert(@sizeOf(KvmSevLaunchSecret) == 48);
+    }
+};
+
 pub const UserspaceMemoryRegion2 = extern struct {
     slot: u32,
     flags: u32,

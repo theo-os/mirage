@@ -37,6 +37,7 @@ const sev_cmd_id = struct {
     const launch_start: u32 = 2;
     const launch_update_data: u32 = 3;
     const launch_update_vmsa: u32 = 4;
+    const launch_secret: u32 = 5;
     const launch_measure: u32 = 6;
     const launch_finish: u32 = 7;
 };
@@ -199,18 +200,67 @@ pub fn sevInit2(self: *Vm) Error!void {
     try self.sevCmd(sev_cmd_id.init2, @intFromPtr(&args), 0);
 }
 
-/// Start the launch. The kernel remembers this sev_fd on the guest, so the update, measure, and
-/// finish commands reuse it and take no fd of their own.
-pub fn launchStart(self: *Vm, policy: u32, sev_fd: std.posix.fd_t) Error!void {
+fn launchStartInner(
+    self: *Vm,
+    policy: u32,
+    sev_fd: std.posix.fd_t,
+    dh_uaddr: u64,
+    dh_len: u32,
+    session_uaddr: u64,
+    session_len: u32,
+) Error!void {
     var args: ioctl.KvmSevLaunchStart = .{
         .handle = 0,
         .policy = policy,
-        .dh_uaddr = 0,
-        .dh_len = 0,
-        .session_uaddr = 0,
-        .session_len = 0,
+        .dh_uaddr = dh_uaddr,
+        .dh_len = dh_len,
+        .session_uaddr = session_uaddr,
+        .session_len = session_len,
     };
     try self.sevCmd(sev_cmd_id.launch_start, @intFromPtr(&args), @intCast(sev_fd));
+}
+
+/// Start the launch. The kernel remembers this sev_fd on the guest, so the update, measure, and
+/// finish commands reuse it and take no fd of their own.
+pub fn launchStart(self: *Vm, policy: u32, sev_fd: std.posix.fd_t) Error!void {
+    try self.launchStartInner(policy, sev_fd, 0, 0, 0, 0);
+}
+
+/// Start the launch with a guest-owner DH certificate and session blob.
+pub fn launchStartAttested(
+    self: *Vm,
+    policy: u32,
+    sev_fd: std.posix.fd_t,
+    dh_cert: []const u8,
+    session: []const u8,
+) Error!void {
+    try self.launchStartInner(
+        policy,
+        sev_fd,
+        @intFromPtr(dh_cert.ptr),
+        @intCast(dh_cert.len),
+        @intFromPtr(session.ptr),
+        @intCast(session.len),
+    );
+}
+
+/// Inject an encrypted secret into guest memory after the launch measurement is accepted.
+pub fn launchSecret(
+    self: *Vm,
+    sev_fd: std.posix.fd_t,
+    hdr: []const u8,
+    guest_uaddr: u64,
+    trans: []const u8,
+) Error!void {
+    var args: ioctl.KvmSevLaunchSecret = .{
+        .hdr_uaddr = @intFromPtr(hdr.ptr),
+        .hdr_len = @intCast(hdr.len),
+        .guest_uaddr = guest_uaddr,
+        .guest_len = @intCast(trans.len),
+        .trans_uaddr = @intFromPtr(trans.ptr),
+        .trans_len = @intCast(trans.len),
+    };
+    try self.sevCmd(sev_cmd_id.launch_secret, @intFromPtr(&args), @intCast(sev_fd));
 }
 
 pub fn launchUpdateData(self: *Vm, uaddr: u64, len: u64) Error!void {
