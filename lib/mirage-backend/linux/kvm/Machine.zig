@@ -70,15 +70,23 @@ pub fn createSevEs(gpa: std.mem.Allocator, cpus: u32) Error!Machine {
     return init(gpa, cpus, vm);
 }
 
-pub fn sevSeal(self: *Machine, region: Backend.GuestMemory.Region, measure: []u8) Error!?[]const u8 {
+pub fn sevUpdateData(self: *Machine, region: Backend.GuestMemory.Region) Error!void {
     std.debug.assert(region.backing == .shared);
     const uaddr = @intFromPtr(region.backing.shared.ptr);
     const len = region.backing.shared.len;
     try self.vm.launchUpdateData(uaddr, len);
+}
+
+pub fn sevMeasureFinish(self: *Machine, measure: []u8) Error!?[]const u8 {
     const got = try self.vm.launchMeasure(measure);
     try self.vm.launchFinish();
     if (got.len == 0) return null;
     return got;
+}
+
+pub fn sevSeal(self: *Machine, region: Backend.GuestMemory.Region, measure: []u8) Error!?[]const u8 {
+    try self.sevUpdateData(region);
+    return self.sevMeasureFinish(measure);
 }
 
 pub fn deinit(self: *Machine) void {

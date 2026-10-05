@@ -277,7 +277,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     defer if (disk) |bytes| gpa.free(bytes);
 
     const create_machine = if (comptime @import("builtin").cpu.arch == .x86_64)
-        if (options.sev)
+        if (options.sev_es)
+            backend.kvm.Machine.createSevEs(gpa, options.cpus)
+        else if (options.sev)
             backend.kvm.Machine.createSev(gpa, options.cpus)
         else
             backend.kvm.Machine.create(gpa, options.cpus)
@@ -440,6 +442,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     defer if (sev_dev) |fd| {
         _ = std.os.linux.close(fd);
     };
+    var sev_measure_buf: [256]u8 = undefined;
 
     if (comptime @import("builtin").cpu.arch == .x86_64) {
         if (came_back == null and options.sev) {
@@ -448,7 +451,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
                 return error.SevUnavailable;
             };
             launch_config.sev_c_bit = arch.platform.hostCBit();
-            try machine.vm.launchStart(options.sev_policy, sev_dev.?);
+            const policy = if (options.sev_es) options.sev_policy | 0x4 else options.sev_policy;
+            try machine.vm.launchStart(policy, sev_dev.?);
         }
     }
 
@@ -459,9 +463,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
 
     if (comptime @import("builtin").cpu.arch == .x86_64) {
         if (came_back == null and options.sev) {
-            var measure_buf: [256]u8 = undefined;
-            if (try machine.sevSeal(region, &measure_buf)) |got| {
-                try out.print("sev launch sealed, measurement {d} bytes\n", .{got.len});
+            if (options.sev_es) {
+                try machine.sevUpdateData(region);
+            } else {
+                if (try machine.sevSeal(region, &sev_measure_buf)) |got| {
+                    try out.print("sev launch sealed, measurement {d} bytes\n", .{got.len});
+                }
             }
         }
     }
@@ -652,6 +659,15 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         // concrete vCPU, because x86 reaches long mode through the full segment and control state a
         // `KVM_SET_SREGS` holds, which the abstract backend does not expose.
         try arch.boot.enter(&machine.vcpus[id], layout);
+
+        if (comptime @import("builtin").cpu.arch == .x86_64) {
+            if (options.sev_es) {
+                try machine.vm.launchUpdateVmsa();
+                if (try machine.sevMeasureFinish(&sev_measure_buf)) |got| {
+                    try out.print("sev-es launch sealed, measurement {d} bytes\n", .{got.len});
+                }
+            }
+        }
     }
 
     // Fold the launch into the chip before the guest runs, the way firmware does for the stages it

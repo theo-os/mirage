@@ -40,6 +40,7 @@ pub const usage =
     \\  --share <n>=<dir>:write  offer it and let the guest change what is in it
     \\  --session <path>      hold the guest up for whoever connects here
     \\  --sev yes             launch the guest under AMD SEV
+    \\  --sev-es yes          launch under SEV-ES (implies --sev yes)
     \\  --sev-policy <n>      SEV launch policy, 0 by default
     \\
 ;
@@ -112,6 +113,8 @@ session: ?[]const u8 = null,
 
 /// Whether to launch the guest under AMD SEV. The C-bit is read from the host CPU.
 sev: bool = false,
+/// Whether to launch under SEV-ES. Setting this also sets sev.
+sev_es: bool = false,
 /// The SEV launch policy. Zero selects the default (no debug, no key sharing).
 sev_policy: u32 = 0,
 
@@ -201,6 +204,10 @@ pub fn parse(args: []const [:0]const u8) !Options {
             options.save = value;
         } else if (std.mem.eql(u8, name, "--restore")) {
             options.restore = value;
+        } else if (std.mem.eql(u8, name, "--sev-es")) {
+            const on = std.mem.eql(u8, value, "yes");
+            options.sev_es = on;
+            if (on) options.sev = true;
         } else if (std.mem.eql(u8, name, "--sev")) {
             options.sev = std.mem.eql(u8, value, "yes");
         } else if (std.mem.eql(u8, name, "--sev-policy")) {
