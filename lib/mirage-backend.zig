@@ -31,6 +31,7 @@ pub const kvm = switch (builtin.os.tag) {
         pub const Machine = @import("mirage-backend/linux/kvm/Machine.zig");
         pub const sev_host = @import("mirage-backend/linux/kvm/sev_host.zig");
         pub const sev_cert = @import("mirage-backend/linux/kvm/sev_cert.zig");
+        pub const sev_session = @import("mirage-backend/linux/kvm/sev_session.zig");
         // The interrupt controller is arm's. An x86 build keeps it out so nothing drags
         // in `mirage-arm64`.
         pub const Gic = if (builtin.cpu.arch == .aarch64) @import("mirage-backend/linux/kvm/Gic.zig") else void;
@@ -53,6 +54,7 @@ test {
         if (builtin.cpu.arch == .aarch64) _ = kvm.Gic;
         _ = kvm.sev_host;
         _ = kvm.sev_cert;
+        _ = kvm.sev_session;
         _ = platform;
     }
 }
